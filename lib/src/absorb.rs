@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use bstr::BString;
 use futures::StreamExt as _;
 use itertools::Itertools as _;
 use thiserror::Error;
@@ -36,8 +35,9 @@ use crate::conflicts::MaterializedFileValue;
 use crate::conflicts::MaterializedTreeValue;
 use crate::conflicts::materialized_diff_stream;
 use crate::copies::CopyRecords;
-use crate::diff::ContentDiff;
+use crate::diff::ContentDiffSelection;
 use crate::diff::DiffHunkKind;
+use crate::diff::TwoWayContentDiff;
 use crate::matchers::Matcher;
 use crate::merge::Diff;
 use crate::merge::Merge;
@@ -117,7 +117,10 @@ pub async fn split_hunks_to_trees(
     let right_tree = &source.source_tree;
     // TODO: enable copy tracking if we add support for annotate and merge
     let copy_records = CopyRecords::default();
-    let tree_diff = left_tree.diff_with_copies(right_tree, matcher, &copy_records);
+    let transition = copy_records
+        .bind(Diff::new(left_tree.clone(), right_tree.clone()))
+        .await?;
+    let tree_diff = transition.diff(matcher);
     let mut diff_stream = materialized_diff_stream(
         repo.store(),
         tree_diff,
@@ -162,7 +165,7 @@ pub async fn split_hunks_to_trees(
             .compact_line_ranges()
             .filter_map(|(commit_id, range)| Some((commit_id.ok()?, range)))
             .collect_vec();
-        let diff = ContentDiff::by_line([&left_text, &right_text]);
+        let diff = TwoWayContentDiff::by_line(&left_text, &right_text);
         let selected_ranges = split_file_hunks(&annotation_ranges, &diff);
         // Build trees containing parent (= left) contents + selected hunks
         for (&commit_id, ranges) in &selected_ranges {
@@ -170,7 +173,11 @@ pub async fn split_hunks_to_trees(
                 .target_commits
                 .entry(commit_id.clone())
                 .or_insert_with(|| MergedTreeBuilder::new(left_tree.clone()));
-            let new_text = combine_texts(&left_text, &right_text, ranges);
+            let new_text = ContentDiffSelection::new(
+                Diff::new(&left_text, &right_text),
+                ranges.iter().cloned(),
+            )
+            .materialize();
             // Since changes to be absorbed are represented as diffs relative to
             // the source parent, we can propagate file deletion only if the
             // whole file content is deleted at a single destination commit.
@@ -194,14 +201,12 @@ pub async fn split_hunks_to_trees(
     Ok(selected_trees)
 }
 
-type SelectedRange = (Range<usize>, Range<usize>);
-
 /// Maps `diff` hunks to commits based on the left `annotation_ranges`. The
 /// `annotation_ranges` should be compacted.
 fn split_file_hunks<'a>(
     mut annotation_ranges: &[(&'a CommitId, Range<usize>)],
-    diff: &ContentDiff,
-) -> HashMap<&'a CommitId, Vec<SelectedRange>> {
+    diff: &TwoWayContentDiff,
+) -> HashMap<&'a CommitId, Vec<Diff<Range<usize>>>> {
     debug_assert!(annotation_ranges.iter().all(|(_, range)| !range.is_empty()));
     let mut selected_ranges: HashMap<&CommitId, Vec<_>> = HashMap::new();
     let mut diff_hunk_ranges = diff
@@ -244,7 +249,7 @@ fn split_file_hunks<'a>(
                     let end = cmp::min(cur_range.end, left_range.end);
                     assert!(start < end);
                     let selected = selected_ranges.entry(commit_id).or_default();
-                    selected.push((start..end, right_range.clone()));
+                    selected.push(Diff::new(start..end, right_range.clone()));
                 }
             }
         } else {
@@ -267,26 +272,11 @@ fn split_file_hunks<'a>(
                     .is_some_and(|(_, next_range)| next_range.start == left_range.end);
             if contained && !ambiguous {
                 let selected = selected_ranges.entry(commit_id).or_default();
-                selected.push((left_range.clone(), right_range.clone()));
+                selected.push(Diff::new(left_range.clone(), right_range.clone()));
             }
         }
     }
     selected_ranges
-}
-
-/// Constructs new text by replacing `text1` range with `text2` range for each
-/// selected `(range1, range2)` pairs.
-fn combine_texts(text1: &[u8], text2: &[u8], selected_ranges: &[SelectedRange]) -> BString {
-    itertools::chain!(
-        [(0..0, 0..0)],
-        selected_ranges.iter().cloned(),
-        [(text1.len()..text1.len(), text2.len()..text2.len())],
-    )
-    .tuple_windows()
-    // Copy unchanged hunk from text1 and current hunk from text2
-    .map(|((prev1, _), (cur1, cur2))| (prev1.end..cur1.start, cur2))
-    .flat_map(|(range1, range2)| [&text1[range1], &text2[range2]])
-    .collect()
 }
 
 /// Describes changes made by [`absorb_hunks()`].
@@ -398,27 +388,30 @@ mod tests {
 
         // unchanged
         assert_eq!(
-            split_file_hunks(&[], &ContentDiff::by_line(["", ""])),
+            split_file_hunks(&[], &TwoWayContentDiff::by_line("", "")),
             hashmap! {}
         );
 
         // insert single line
         assert_eq!(
-            split_file_hunks(&[], &ContentDiff::by_line(["", "2X\n"])),
+            split_file_hunks(&[], &TwoWayContentDiff::by_line("", "2X\n")),
             hashmap! {}
         );
         // delete single line
         assert_eq!(
-            split_file_hunks(&[(commit_id1, 0..3)], &ContentDiff::by_line(["1a\n", ""])),
-            hashmap! { commit_id1 => vec![(0..3, 0..0)] }
+            split_file_hunks(
+                &[(commit_id1, 0..3)],
+                &TwoWayContentDiff::by_line("1a\n", "")
+            ),
+            hashmap! { commit_id1 => vec![Diff::new(0..3, 0..0)] }
         );
         // modify single line
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..3)],
-                &ContentDiff::by_line(["1a\n", "1AA\n"])
+                &TwoWayContentDiff::by_line("1a\n", "1AA\n")
             ),
-            hashmap! { commit_id1 => vec![(0..3, 0..4)] }
+            hashmap! { commit_id1 => vec![Diff::new(0..3, 0..4)] }
         );
     }
 
@@ -430,29 +423,42 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6)],
-                &ContentDiff::by_line(["1a\n1b\n", "1X\n1a\n1Y\n1b\n1Z\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n", "1X\n1a\n1Y\n1b\n1Z\n")
             ),
             hashmap! {
-                commit_id1 => vec![(0..0, 0..3), (3..3, 6..9), (6..6, 12..15)],
+                commit_id1 => vec![
+                    Diff::new(0..0, 0..3),
+                    Diff::new(3..3, 6..9),
+                    Diff::new(6..6, 12..15),
+                ],
             }
         );
         // delete first, middle, and last lines
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..15)],
-                &ContentDiff::by_line(["1a\n1b\n1c\n1d\n1e\n1f\n", "1b\n1d\n1f\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n1c\n1d\n1e\n1f\n", "1b\n1d\n1f\n")
             ),
             hashmap! {
-                commit_id1 => vec![(0..3, 0..0), (6..9, 3..3), (12..15, 6..6)],
+                commit_id1 => vec![
+                    Diff::new(0..3, 0..0),
+                    Diff::new(6..9, 3..3),
+                    Diff::new(12..15, 6..6),
+                ],
             }
         );
         // modify non-contiguous lines
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..12)],
-                &ContentDiff::by_line(["1a\n1b\n1c\n1d\n", "1A\n1b\n1C\n1d\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n1c\n1d\n", "1A\n1b\n1C\n1d\n")
             ),
-            hashmap! { commit_id1 => vec![(0..3, 0..3), (6..9, 6..9)] }
+            hashmap! {
+                commit_id1 => vec![
+                    Diff::new(0..3, 0..3),
+                    Diff::new(6..9, 6..9),
+                ]
+            }
         );
     }
 
@@ -465,23 +471,23 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1X\n1a\n1b\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1X\n1a\n1b\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(0..0, 0..3)] }
+            hashmap! { commit_id1 => vec![Diff::new(0..0, 0..3)] }
         );
         // insert middle line to first range
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1X\n1b\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1X\n1b\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(3..3, 3..6)] }
+            hashmap! { commit_id1 => vec![Diff::new(3..3, 3..6)] }
         );
         // insert middle line between ranges (ambiguous)
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1b\n3X\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1b\n3X\n2a\n2b\n")
             ),
             hashmap! {}
         );
@@ -489,17 +495,17 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1b\n2a\n2X\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1b\n2a\n2X\n2b\n")
             ),
-            hashmap! { commit_id2 => vec![(9..9, 9..12)] }
+            hashmap! { commit_id2 => vec![Diff::new(9..9, 9..12)] }
         );
         // insert last line
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1b\n2a\n2b\n2X\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1b\n2a\n2b\n2X\n")
             ),
-            hashmap! { commit_id2 => vec![(12..12, 12..15)] }
+            hashmap! { commit_id2 => vec![Diff::new(12..12, 12..15)] }
         );
     }
 
@@ -512,43 +518,43 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1b\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1b\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(0..3, 0..0)] }
+            hashmap! { commit_id1 => vec![Diff::new(0..3, 0..0)] }
         );
         // delete middle line from first range
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(3..6, 3..3)] }
+            hashmap! { commit_id1 => vec![Diff::new(3..6, 3..3)] }
         );
         // delete middle line from second range
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1b\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1b\n2b\n")
             ),
-            hashmap! { commit_id2 => vec![(6..9, 6..6)] }
+            hashmap! { commit_id2 => vec![Diff::new(6..9, 6..6)] }
         );
         // delete last line
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1b\n2a\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1b\n2a\n")
             ),
-            hashmap! { commit_id2 => vec![(9..12, 9..9)] }
+            hashmap! { commit_id2 => vec![Diff::new(9..12, 9..9)] }
         );
         // delete first and last lines
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1b\n2a\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1b\n2a\n")
             ),
             hashmap! {
-                commit_id1 => vec![(0..3, 0..0)],
-                commit_id2 => vec![(9..12, 6..6)],
+                commit_id1 => vec![Diff::new(0..3, 0..0)],
+                commit_id2 => vec![Diff::new(9..12, 6..6)],
             }
         );
 
@@ -556,33 +562,33 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n")
             ),
             hashmap! {
-                commit_id1 => vec![(3..6, 3..3)],
-                commit_id2 => vec![(6..12, 3..3)],
+                commit_id1 => vec![Diff::new(3..6, 3..3)],
+                commit_id2 => vec![Diff::new(6..12, 3..3)],
             }
         );
         // delete middle lines across ranges (split both annotation ranges)
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n2b\n")
             ),
             hashmap! {
-                commit_id1 => vec![(3..6, 3..3)],
-                commit_id2 => vec![(6..9, 3..3)],
+                commit_id1 => vec![Diff::new(3..6, 3..3)],
+                commit_id2 => vec![Diff::new(6..9, 3..3)],
             }
         );
         // delete across ranges (split second annotation range)
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "2b\n")
             ),
             hashmap! {
-                commit_id1 => vec![(0..6, 0..0)],
-                commit_id2 => vec![(6..9, 0..0)],
+                commit_id1 => vec![Diff::new(0..6, 0..0)],
+                commit_id2 => vec![Diff::new(6..9, 0..0)],
             }
         );
 
@@ -590,11 +596,11 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", ""])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "")
             ),
             hashmap! {
-                commit_id1 => vec![(0..6, 0..0)],
-                commit_id2 => vec![(6..12, 0..0)],
+                commit_id1 => vec![Diff::new(0..6, 0..0)],
+                commit_id2 => vec![Diff::new(6..12, 0..0)],
             }
         );
     }
@@ -608,24 +614,24 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1A\n1b\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1A\n1b\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(0..3, 0..3)] }
+            hashmap! { commit_id1 => vec![Diff::new(0..3, 0..3)] }
         );
         // modify middle line of first range
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1B\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1B\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(3..6, 3..6)] }
+            hashmap! { commit_id1 => vec![Diff::new(3..6, 3..6)] }
         );
         // modify middle lines of both ranges (ambiguous)
         // ('hg absorb' accepts this)
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1B\n2A\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1B\n2A\n2b\n")
             ),
             hashmap! {}
         );
@@ -633,27 +639,27 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1b\n2A\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1b\n2A\n2b\n")
             ),
-            hashmap! { commit_id2 => vec![(6..9, 6..9)] }
+            hashmap! { commit_id2 => vec![Diff::new(6..9, 6..9)] }
         );
         // modify last line
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1b\n2a\n2B\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1b\n2a\n2B\n")
             ),
-            hashmap! { commit_id2 => vec![(9..12, 9..12)] }
+            hashmap! { commit_id2 => vec![Diff::new(9..12, 9..12)] }
         );
         // modify first and last lines
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1A\n1b\n2a\n2B\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1A\n1b\n2a\n2B\n")
             ),
             hashmap! {
-                commit_id1 => vec![(0..3, 0..3)],
-                commit_id2 => vec![(9..12, 9..12)],
+                commit_id1 => vec![Diff::new(0..3, 0..3)],
+                commit_id2 => vec![Diff::new(9..12, 9..12)],
             }
         );
     }
@@ -667,36 +673,36 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1A\n1B\n1X\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1A\n1B\n1X\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(0..6, 0..9)] }
+            hashmap! { commit_id1 => vec![Diff::new(0..6, 0..9)] }
         );
         // modify second range, insert adjacent middle line
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1b\n2X\n2A\n2B\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1b\n2X\n2A\n2B\n")
             ),
-            hashmap! { commit_id2 => vec![(6..12, 6..15)] }
+            hashmap! { commit_id2 => vec![Diff::new(6..12, 6..15)] }
         );
         // modify second range, insert last line
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1b\n2A\n2B\n2X\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1b\n2A\n2B\n2X\n")
             ),
-            hashmap! { commit_id2 => vec![(6..12, 6..15)] }
+            hashmap! { commit_id2 => vec![Diff::new(6..12, 6..15)] }
         );
         // modify first and last lines (unambiguous), insert middle line between
         // ranges (ambiguous)
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1A\n1b\n3X\n2a\n2B\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1A\n1b\n3X\n2a\n2B\n")
             ),
             hashmap! {
-                commit_id1 => vec![(0..3, 0..3)],
-                commit_id2 => vec![(9..12, 12..15)],
+                commit_id1 => vec![Diff::new(0..3, 0..3)],
+                commit_id2 => vec![Diff::new(9..12, 12..15)],
             }
         );
     }
@@ -710,45 +716,45 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1A\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1A\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(0..6, 0..3)] }
+            hashmap! { commit_id1 => vec![Diff::new(0..6, 0..3)] }
         );
         // modify last line, delete adjacent middle line
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1b\n2B\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1b\n2B\n")
             ),
-            hashmap! { commit_id2 => vec![(6..12, 6..9)] }
+            hashmap! { commit_id2 => vec![Diff::new(6..12, 6..9)] }
         );
         // modify first and last lines, delete middle line from first range
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1A\n2a\n2B\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1A\n2a\n2B\n")
             ),
             hashmap! {
-                commit_id1 => vec![(0..6, 0..3)],
-                commit_id2 => vec![(9..12, 6..9)],
+                commit_id1 => vec![Diff::new(0..6, 0..3)],
+                commit_id2 => vec![Diff::new(9..12, 6..9)],
             }
         );
         // modify first and last lines, delete middle line from second range
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1A\n1b\n2B\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1A\n1b\n2B\n")
             ),
             hashmap! {
-                commit_id1 => vec![(0..3, 0..3)],
-                commit_id2 => vec![(6..12, 6..9)],
+                commit_id1 => vec![Diff::new(0..3, 0..3)],
+                commit_id2 => vec![Diff::new(6..12, 6..9)],
             }
         );
         // modify middle line, delete adjacent middle line (ambiguous)
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), (commit_id2, 6..12)],
-                &ContentDiff::by_line(["1a\n1b\n2a\n2b\n", "1a\n1B\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n2a\n2b\n", "1a\n1B\n2b\n")
             ),
             hashmap! {}
         );
@@ -763,27 +769,27 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n1X\n0a\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n1X\n0a\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(6..6, 6..9)] }
+            hashmap! { commit_id1 => vec![Diff::new(6..6, 6..9)] }
         );
         // insert middle line to second range
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0a\n2X\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0a\n2X\n2a\n2b\n")
             ),
-            hashmap! { commit_id2 => vec![(9..9, 9..12)] }
+            hashmap! { commit_id2 => vec![Diff::new(9..9, 9..12)] }
         );
         // insert middle lines to both ranges
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n1X\n0a\n2X\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n1X\n0a\n2X\n2a\n2b\n")
             ),
             hashmap! {
-                commit_id1 => vec![(6..6, 6..9)],
-                commit_id2 => vec![(9..9, 12..15)],
+                commit_id1 => vec![Diff::new(6..6, 6..9)],
+                commit_id2 => vec![Diff::new(9..9, 12..15)],
             }
         );
     }
@@ -797,7 +803,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n1X\n0A\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n1X\n0A\n2a\n2b\n")
             ),
             hashmap! {}
         );
@@ -805,7 +811,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0A\n2X\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0A\n2X\n2a\n2b\n")
             ),
             hashmap! {}
         );
@@ -813,7 +819,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n1X\n0A\n2X\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n1X\n0A\n2X\n2a\n2b\n")
             ),
             hashmap! {}
         );
@@ -828,27 +834,27 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n0a\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n0a\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(3..6, 3..3)] }
+            hashmap! { commit_id1 => vec![Diff::new(3..6, 3..3)] }
         );
         // delete middle line from second range
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0a\n2b\n")
             ),
-            hashmap! { commit_id2 => vec![(9..12, 9..9)] }
+            hashmap! { commit_id2 => vec![Diff::new(9..12, 9..9)] }
         );
         // delete middle lines from both ranges
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n0a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n0a\n2b\n")
             ),
             hashmap! {
-                commit_id1 => vec![(3..6, 3..3)],
-                commit_id2 => vec![(9..12, 6..6)],
+                commit_id1 => vec![Diff::new(3..6, 3..3)],
+                commit_id2 => vec![Diff::new(9..12, 6..6)],
             }
         );
     }
@@ -862,7 +868,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n0A\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n0A\n2a\n2b\n")
             ),
             hashmap! {}
         );
@@ -870,7 +876,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0A\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0A\n2b\n")
             ),
             hashmap! {}
         );
@@ -878,7 +884,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n0A\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n0A\n2b\n")
             ),
             hashmap! {}
         );
@@ -896,7 +902,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n2a\n2b\n")
             ),
             hashmap! {}
         );
@@ -904,7 +910,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n2b\n")
             ),
             hashmap! {}
         );
@@ -912,7 +918,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n2b\n")
             ),
             hashmap! {}
         );
@@ -927,27 +933,27 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1B\n0a\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1B\n0a\n2a\n2b\n")
             ),
-            hashmap! { commit_id1 => vec![(3..6, 3..6)] }
+            hashmap! { commit_id1 => vec![Diff::new(3..6, 3..6)] }
         );
         // modify middle line of second range
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0a\n2A\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0a\n2A\n2b\n")
             ),
-            hashmap! { commit_id2 => vec![(9..12, 9..12)] }
+            hashmap! { commit_id2 => vec![Diff::new(9..12, 9..12)] }
         );
         // modify middle lines of both ranges
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1B\n0a\n2A\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1B\n0a\n2A\n2b\n")
             ),
             hashmap! {
-                commit_id1 => vec![(3..6, 3..6)],
-                commit_id2 => vec![(9..12, 9..12)],
+                commit_id1 => vec![Diff::new(3..6, 3..6)],
+                commit_id2 => vec![Diff::new(9..12, 9..12)],
             }
         );
     }
@@ -961,7 +967,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1B\n0A\n2a\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1B\n0A\n2a\n2b\n")
             ),
             hashmap! {}
         );
@@ -969,7 +975,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0A\n2A\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1b\n0A\n2A\n2b\n")
             ),
             hashmap! {}
         );
@@ -977,7 +983,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6), /* 6..9, */ (commit_id2, 9..15)],
-                &ContentDiff::by_line(["1a\n1b\n0a\n2a\n2b\n", "1a\n1B\n0A\n2A\n2b\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n2a\n2b\n", "1a\n1B\n0A\n2A\n2b\n")
             ),
             hashmap! {}
         );
@@ -991,9 +997,9 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6) /* , 6..9 */],
-                &ContentDiff::by_line(["1a\n1b\n0a\n", "1a\n1b\n1X\n0a\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n", "1a\n1b\n1X\n0a\n")
             ),
-            hashmap! { commit_id1 => vec![(6..6, 6..9)] }
+            hashmap! { commit_id1 => vec![Diff::new(6..6, 6..9)] }
         );
     }
 
@@ -1005,7 +1011,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6) /* , 6..9 */],
-                &ContentDiff::by_line(["1a\n1b\n0a\n", "1a\n1b\n1X\n0A\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n", "1a\n1b\n1X\n0A\n")
             ),
             hashmap! {}
         );
@@ -1019,17 +1025,17 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6) /* , 6..9 */],
-                &ContentDiff::by_line(["1a\n1b\n0a\n", "1a\n0a\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n", "1a\n0a\n")
             ),
-            hashmap! { commit_id1 => vec![(3..6, 3..3)] }
+            hashmap! { commit_id1 => vec![Diff::new(3..6, 3..3)] }
         );
         // delete all lines from range
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6) /* , 6..9 */],
-                &ContentDiff::by_line(["1a\n1b\n0a\n", "0a\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n", "0a\n")
             ),
-            hashmap! { commit_id1 => vec![(0..6, 0..0)] }
+            hashmap! { commit_id1 => vec![Diff::new(0..6, 0..0)] }
         );
     }
 
@@ -1041,7 +1047,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6) /* , 6..9 */],
-                &ContentDiff::by_line(["1a\n1b\n0a\n", "1a\n0A\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n", "1a\n0A\n")
             ),
             hashmap! {}
         );
@@ -1049,7 +1055,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6) /* , 6..9 */],
-                &ContentDiff::by_line(["1a\n1b\n0a\n", "0A\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n", "0A\n")
             ),
             hashmap! {}
         );
@@ -1066,7 +1072,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6) /* , 6..9 */],
-                &ContentDiff::by_line(["1a\n1b\n0a\n", "1a\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n", "1a\n")
             ),
             hashmap! {}
         );
@@ -1074,7 +1080,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6) /* , 6..9 */],
-                &ContentDiff::by_line(["1a\n1b\n0a\n", ""])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n", "")
             ),
             hashmap! {}
         );
@@ -1088,9 +1094,9 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6) /* , 6..9 */],
-                &ContentDiff::by_line(["1a\n1b\n0a\n", "1a\n1B\n0a\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n", "1a\n1B\n0a\n")
             ),
-            hashmap! { commit_id1 => vec![(3..6, 3..6)] }
+            hashmap! { commit_id1 => vec![Diff::new(3..6, 3..6)] }
         );
     }
 
@@ -1102,7 +1108,7 @@ mod tests {
         assert_eq!(
             split_file_hunks(
                 &[(commit_id1, 0..6) /* , 6..9 */],
-                &ContentDiff::by_line(["1a\n1b\n0a\n", "1a\n1B\n0A\n"])
+                &TwoWayContentDiff::by_line("1a\n1b\n0a\n", "1a\n1B\n0A\n")
             ),
             hashmap! {}
         );
@@ -1122,39 +1128,21 @@ mod tests {
                     (commit_id1, 6..15),  // 1b 1c 1d => 1B 1d
                     (commit_id3, 15..21), // 3a 3b    => 3X 3A 3b 3Y
                 ],
-                &ContentDiff::by_line([
+                &TwoWayContentDiff::by_line(
                     "1a\n2a\n1b\n1c\n1d\n3a\n3b\n",
                     "1A\n2a\n1B\n1d\n3X\n3A\n3b\n3Y\n"
-                ])
+                )
             ),
             hashmap! {
-                commit_id1 => vec![(0..3, 0..3), (6..12, 6..9)],
-                commit_id3 => vec![(15..18, 12..18), (21..21, 21..24)],
+                commit_id1 => vec![
+                    Diff::new(0..3, 0..3),
+                    Diff::new(6..12, 6..9),
+                ],
+                commit_id3 => vec![
+                    Diff::new(15..18, 12..18),
+                    Diff::new(21..21, 21..24),
+                ],
             }
-        );
-    }
-
-    #[test]
-    fn test_combine_texts() {
-        assert_eq!(combine_texts(b"", b"", &[]), "");
-        assert_eq!(combine_texts(b"foo", b"bar", &[]), "foo");
-        assert_eq!(combine_texts(b"foo", b"bar", &[(0..3, 0..3)]), "bar");
-
-        assert_eq!(
-            combine_texts(
-                b"1a\n2a\n1b\n1c\n1d\n3a\n3b\n",
-                b"1A\n2a\n1B\n1d\n3X\n3A\n3b\n3Y\n",
-                &[(0..3, 0..3), (6..12, 6..9)]
-            ),
-            "1A\n2a\n1B\n1d\n3a\n3b\n"
-        );
-        assert_eq!(
-            combine_texts(
-                b"1a\n2a\n1b\n1c\n1d\n3a\n3b\n",
-                b"1A\n2a\n1B\n1d\n3X\n3A\n3b\n3Y\n",
-                &[(15..18, 12..18), (21..21, 21..24)]
-            ),
-            "1a\n2a\n1b\n1c\n1d\n3X\n3A\n3b\n3Y\n"
         );
     }
 }

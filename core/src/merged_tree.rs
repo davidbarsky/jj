@@ -38,11 +38,8 @@ use crate::backend::MergedTreeValueExt as _;
 use crate::backend::TreeId;
 use crate::backend::TreeValue;
 use crate::conflict_labels::ConflictLabels;
-use crate::copies::CopiesTreeDiffEntry;
 use crate::copies::CopyHistoryDiffStream;
 use crate::copies::CopyHistoryTreeDiffEntry;
-use crate::copies::CopyRecords;
-use crate::copies::copies_tree_diff_stream;
 use crate::filtered_tree_writer::FilteredTreeWriter;
 use crate::matchers::EverythingMatcher;
 use crate::matchers::Matcher;
@@ -339,17 +336,6 @@ impl MergedTree {
     /// this tree's.
     pub async fn filtered(&self, matcher: &dyn Matcher) -> BackendResult<Self> {
         FilteredTreeWriter::new(self, matcher).write().await
-    }
-
-    /// Like `diff()` but takes the given copy records into account.
-    pub fn diff_with_copies<'a>(
-        &self,
-        other: &Self,
-        matcher: &'a dyn Matcher,
-        copy_records: &'a CopyRecords,
-    ) -> BoxStream<'a, CopiesTreeDiffEntry> {
-        let stream = self.diff(other, matcher);
-        copies_tree_diff_stream(stream, self.clone(), other.clone(), copy_records)
     }
 
     /// Like `diff()` but takes CopyHistory into account.

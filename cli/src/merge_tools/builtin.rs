@@ -603,9 +603,8 @@ pub async fn edit_diff_builtin(
     let store = trees.before.store().clone();
     // TODO: handle copy tracking
     let copy_records = CopyRecords::default();
-    let tree_diff = trees
-        .before
-        .diff_with_copies(trees.after, matcher, &copy_records);
+    let transition = copy_records.bind(trees.map(Clone::clone)).await?;
+    let tree_diff = transition.diff(matcher);
     let (changed_files, files) =
         make_diff_files(&store, trees, tree_diff, conflict_marker_style).await?;
     let mut input = scm_record::helpers::CrosstermInput;
@@ -843,7 +842,11 @@ mod tests {
         matcher: &dyn Matcher,
     ) -> (Vec<RepoPathBuf>, Vec<scm_record::File<'static>>) {
         let copy_records = CopyRecords::default();
-        let tree_diff = left_tree.diff_with_copies(right_tree, matcher, &copy_records);
+        let transition = copy_records
+            .bind(Diff::new(left_tree.clone(), right_tree.clone()))
+            .block_on()
+            .unwrap();
+        let tree_diff = transition.diff(matcher);
         make_diff_files(
             store,
             Diff::new(left_tree, right_tree),

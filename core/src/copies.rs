@@ -23,8 +23,8 @@ use std::task::ready;
 
 use futures::Stream;
 use futures::StreamExt as _;
+use futures::TryStreamExt as _;
 use futures::future::BoxFuture;
-use futures::future::Either;
 use futures::future::ready;
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
@@ -36,13 +36,19 @@ use itertools::Itertools as _;
 
 use crate::backend::BackendError;
 use crate::backend::BackendResult;
+use crate::backend::CommitId;
 use crate::backend::CopyHistory;
 use crate::backend::CopyId;
 use crate::backend::CopyRecord;
+use crate::backend::FileId;
 use crate::backend::MergedTreeValue;
 use crate::backend::MergedTreeValueExt as _;
 use crate::backend::TreeValue;
+use crate::content_hash::ContentHash;
 use crate::dag_walk;
+use crate::matchers::FilesMatcher;
+use crate::matchers::Matcher;
+use crate::matchers::UnionMatcher;
 use crate::merge::Diff;
 use crate::merge::Merge;
 use crate::merge::SameChange;
@@ -51,76 +57,222 @@ use crate::merged_tree::TreeDiffEntry;
 use crate::merged_tree::TreeDiffStream;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
+use crate::store::Store;
 
-/// A collection of CopyRecords.
+/// Copy records awaiting binding to a tree transition.
 #[derive(Default, Debug)]
 pub struct CopyRecords {
     records: Vec<CopyRecord>,
-    // Maps from `source` or `target` to the index of the entry in `records`.
-    // Conflicts are excluded by keeping an out of range value.
-    sources: HashMap<RepoPathBuf, usize>,
-    targets: HashMap<RepoPathBuf, usize>,
+}
+
+#[derive(Debug)]
+enum CopyRecordBinding {
+    Unique(usize),
+    Ambiguous,
 }
 
 impl CopyRecords {
-    /// Adds information about `CopyRecord`s to `self`. A target with multiple
-    /// conflicts is discarded and treated as not having an origin.
+    /// Collects each source/destination pair, deduplicating shared merge ancestry.
+    pub async fn collect(
+        store: &Store,
+        roots: &[CommitId],
+        heads: &[CommitId],
+        matcher: &dyn Matcher,
+    ) -> BackendResult<Self> {
+        let mut records = Self::default();
+        for root in roots {
+            for head in heads {
+                let mut stream = store.get_copy_records(None, root, head)?;
+                while let Some(record) = stream.try_next().await? {
+                    if matcher.matches(&record.target) {
+                        records.add_records([record]);
+                    }
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    /// Keeps distinct source identities until the tree pair determines applicability.
     pub fn add_records(&mut self, copy_records: impl IntoIterator<Item = CopyRecord>) {
-        for r in copy_records {
-            // The same copy or rename is reported once per parent when diffing a
-            // merge commit. Identical (source, target) pairs describe the same
-            // operation, so skip the duplicate instead of marking both maps as
-            // conflicting, which would otherwise drop the copy/rename entirely.
-            let is_duplicate = self
-                .targets
-                .get(&r.target)
-                .and_then(|&i| self.records.get(i))
-                .is_some_and(|existing| existing.source == r.source);
-            if is_duplicate {
+        for record in copy_records {
+            if self.records.iter().any(|existing| {
+                existing.source == record.source
+                    && existing.target == record.target
+                    && existing.source_file == record.source_file
+            }) {
                 continue;
             }
-            self.sources
-                .entry(r.source.clone())
-                // TODO: handle conflicts instead of ignoring both sides.
-                .and_modify(|value| *value = usize::MAX)
-                .or_insert(self.records.len());
-            self.targets
-                .entry(r.target.clone())
-                // TODO: handle conflicts instead of ignoring both sides.
-                .and_modify(|value| *value = usize::MAX)
-                .or_insert(self.records.len());
-            self.records.push(r);
+            self.records.push(record);
         }
     }
 
-    /// Returns true if there are copy records associated with a source path.
-    pub fn has_source(&self, source: &RepoPath) -> bool {
-        self.sources.contains_key(source)
-    }
-
-    /// Gets any copy record associated with a source path.
-    pub fn for_source(&self, source: &RepoPath) -> Option<&CopyRecord> {
-        self.sources.get(source).and_then(|&i| self.records.get(i))
-    }
-
-    /// Returns true if there are copy records associated with a target path.
-    pub fn has_target(&self, target: &RepoPath) -> bool {
-        self.targets.contains_key(target)
-    }
-
-    /// Gets any copy record associated with a target path.
-    pub fn for_target(&self, target: &RepoPath) -> Option<&CopyRecord> {
-        self.targets.get(target).and_then(|&i| self.records.get(i))
-    }
-
-    /// Gets all copy records.
+    /// Returns the unbound records.
     pub fn iter(&self) -> impl Iterator<Item = &CopyRecord> {
         self.records.iter()
+    }
+
+    /// Captures applicable relations and source values for exactly these trees.
+    /// Ambiguity is determined after stale source identities are excluded.
+    pub async fn bind(&self, trees: Diff<MergedTree>) -> BackendResult<CopyTransition> {
+        let mut records = ApplicableCopyRecords::default();
+        for record in &self.records {
+            let source_value = trees.before.path_value(&record.source).await?;
+            let source_at_target = trees.after.path_value(&record.source).await?;
+            match find_copy_source(&source_value, record)
+                .or_else(|| find_copy_source(&source_at_target, record))
+            {
+                Some(_) => records.add(ApplicableCopyRecord {
+                    record: record.clone(),
+                    source_value,
+                    source_at_target,
+                }),
+                None => continue,
+            }
+        }
+        let transition = CopyTransition { trees, records };
+        Ok(transition)
+    }
+}
+
+/// Binds copy applicability, matching, and enumeration to one tree pair.
+#[derive(Debug)]
+pub struct CopyTransition {
+    trees: Diff<MergedTree>,
+    records: ApplicableCopyRecords,
+}
+
+impl CopyTransition {
+    /// Returns the trees whose copy relations were captured.
+    pub fn trees(&self) -> &Diff<MergedTree> {
+        &self.trees
+    }
+
+    /// Extends a path match across both endpoints of each applicable copy.
+    pub fn matcher<'a>(
+        &self,
+        matcher: &'a dyn Matcher,
+    ) -> UnionMatcher<&'a dyn Matcher, FilesMatcher> {
+        let mut related_paths = Vec::new();
+        for index in 0..self.records.records.len() {
+            let Some(applicable_record) = self.records.unambiguous_target_record(index) else {
+                continue;
+            };
+            let record = &applicable_record.record;
+            let related_path = if matcher.matches(&record.source) {
+                record.target.clone()
+            } else if matcher.matches(&record.target) {
+                record.source.clone()
+            } else {
+                continue;
+            };
+            related_paths.push(related_path);
+        }
+        UnionMatcher::new(matcher, FilesMatcher::new(related_paths))
+    }
+
+    /// Enumerates using the same relations used by [`Self::matcher`].
+    pub fn diff<'a>(&'a self, matcher: &'a dyn Matcher) -> BoxStream<'a, CopiesTreeDiffEntry> {
+        self.trees
+            .before
+            .diff(&self.trees.after, matcher)
+            .filter(|entry| {
+                match (
+                    &entry.values,
+                    self.records.for_target(&entry.path),
+                    self.records.for_source(&entry.path),
+                ) {
+                    (Ok(diff), None, Some(_)) => ready(!diff.after.is_absent()),
+                    (Ok(_), None, None) | (Ok(_), Some(_), _) | (Err(_), _, _) => ready(true),
+                }
+            })
+            .map(|entry| {
+                let Some(applicable) = self.records.for_target(&entry.path) else {
+                    return CopiesTreeDiffEntry {
+                        path: CopiesTreeDiffEntryPath {
+                            source: None,
+                            target: entry.path,
+                        },
+                        values: entry.values,
+                    };
+                };
+                let operation = match self.records.for_source(&applicable.record.source) {
+                    Some(_)
+                        if applicable.source_at_target.is_absent()
+                            || applicable.source_at_target.is_tree() =>
+                    {
+                        CopyOperation::Rename
+                    }
+                    Some(_) | None => CopyOperation::Copy,
+                };
+                CopiesTreeDiffEntry {
+                    path: CopiesTreeDiffEntryPath {
+                        source: Some((applicable.record.source.clone(), operation)),
+                        target: entry.path,
+                    },
+                    values: entry
+                        .values
+                        .map(|values| Diff::new(applicable.source_value.clone(), values.after)),
+                }
+            })
+            .boxed()
+    }
+}
+
+#[derive(Default, Debug)]
+struct ApplicableCopyRecords {
+    records: Vec<ApplicableCopyRecord>,
+    sources: HashMap<RepoPathBuf, CopyRecordBinding>,
+    targets: HashMap<RepoPathBuf, CopyRecordBinding>,
+}
+
+#[derive(Debug)]
+struct ApplicableCopyRecord {
+    record: CopyRecord,
+    source_value: MergedTreeValue,
+    source_at_target: MergedTreeValue,
+}
+
+impl ApplicableCopyRecords {
+    fn add(&mut self, record: ApplicableCopyRecord) {
+        let index = self.records.len();
+        self.sources
+            .entry(record.record.source.clone())
+            .and_modify(|index| *index = CopyRecordBinding::Ambiguous)
+            .or_insert(CopyRecordBinding::Unique(index));
+        self.targets
+            .entry(record.record.target.clone())
+            .and_modify(|index| *index = CopyRecordBinding::Ambiguous)
+            .or_insert(CopyRecordBinding::Unique(index));
+        self.records.push(record);
+    }
+
+    fn unambiguous_target_record(&self, index: usize) -> Option<&ApplicableCopyRecord> {
+        let record = self.records.get(index)?;
+        let CopyRecordBinding::Unique(target_index) = self.targets.get(&record.record.target)?
+        else {
+            return None;
+        };
+        (index == *target_index).then_some(record)
+    }
+
+    fn for_source(&self, source: &RepoPath) -> Option<&ApplicableCopyRecord> {
+        let CopyRecordBinding::Unique(index) = self.sources.get(source)? else {
+            return None;
+        };
+        self.unambiguous_target_record(*index)
+    }
+
+    fn for_target(&self, target: &RepoPath) -> Option<&ApplicableCopyRecord> {
+        let CopyRecordBinding::Unique(index) = self.targets.get(target)? else {
+            return None;
+        };
+        self.unambiguous_target_record(*index)
     }
 }
 
 /// Whether or not the source path was deleted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, ContentHash, Debug, Eq, PartialEq)]
 pub enum CopyOperation {
     /// The source path was not deleted.
     Copy,
@@ -170,77 +322,22 @@ impl CopiesTreeDiffEntryPath {
     }
 }
 
-/// Wraps a `TreeDiffStream`, adding support for copies and renames.
-pub fn copies_tree_diff_stream<'a>(
-    inner: TreeDiffStream<'a>,
-    source_tree: MergedTree,
-    target_tree: MergedTree,
-    copy_records: &'a CopyRecords,
-) -> BoxStream<'a, CopiesTreeDiffEntry> {
-    let concurrency = source_tree.store().concurrency();
-    inner
-        .filter(move |diff_entry| {
-            let target_deleted = matches!(&diff_entry.values, Ok(diff) if diff.after.is_absent());
-            // Skip the "delete" entry when there is a rename.
-            let skip = target_deleted
-                && copy_records.for_target(&diff_entry.path).is_none()
-                && copy_records.has_source(&diff_entry.path);
-            ready(!skip)
-        })
-        .map(move |diff_entry| {
-            let Some(CopyRecord { source, .. }) = copy_records.for_target(&diff_entry.path) else {
-                return Either::Left(ready(CopiesTreeDiffEntry {
-                    path: CopiesTreeDiffEntryPath {
-                        source: None,
-                        target: diff_entry.path,
-                    },
-                    values: diff_entry.values,
-                }));
-            };
-            let source_tree = source_tree.clone();
-            let target_tree = target_tree.clone();
-            Either::Right(async move {
-                let (copy_op, values) = match resolve_copy_source(
-                    &source_tree,
-                    &target_tree,
-                    source,
-                    diff_entry.values,
-                )
-                .await
-                {
-                    Ok((copy_op, values)) => (copy_op, Ok(values)),
-                    // Fall back to "copy" (= path still exists) if unknown.
-                    Err(err) => (CopyOperation::Copy, Err(err)),
-                };
-                CopiesTreeDiffEntry {
-                    path: CopiesTreeDiffEntryPath {
-                        source: Some((source.to_owned(), copy_op)),
-                        target: diff_entry.path,
-                    },
-                    values,
-                }
-            })
-        })
-        .buffered(concurrency)
-        .boxed()
-}
-
-async fn resolve_copy_source(
-    source_tree: &MergedTree,
-    target_tree: &MergedTree,
-    source: &RepoPath,
-    values: BackendResult<Diff<MergedTreeValue>>,
-) -> BackendResult<(CopyOperation, Diff<MergedTreeValue>)> {
-    let target_value = values?.after;
-    let source_value = source_tree.path_value(source).await?;
-    // If the source path is deleted in the target tree, it's a rename.
-    let source_value_at_target = target_tree.path_value(source).await?;
-    let copy_op = if source_value_at_target.is_absent() || source_value_at_target.is_tree() {
-        CopyOperation::Rename
-    } else {
-        CopyOperation::Copy
-    };
-    Ok((copy_op, Diff::new(source_value, target_value)))
+fn find_copy_source<'a>(value: &'a MergedTreeValue, record: &CopyRecord) -> Option<&'a FileId> {
+    value.iter().find_map(|term| match term {
+        Some(TreeValue::File {
+            id,
+            executable: _,
+            copy_id: _,
+        }) if id == &record.source_file => Some(id),
+        Some(TreeValue::File {
+            id: _,
+            executable: _,
+            copy_id: _,
+        }) => None,
+        None | Some(TreeValue::Symlink(_) | TreeValue::Tree(_) | TreeValue::GitSubmodule(_)) => {
+            None
+        }
+    })
 }
 
 /// Maps `CopyId`s to `CopyHistory`s

@@ -48,6 +48,7 @@ use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use pollster::FutureExt as _;
 use pretty_assertions::assert_eq;
+use test_case::test_case;
 use testutils::TestRepo;
 use testutils::TestResult;
 use testutils::TestTreeBuilder;
@@ -79,6 +80,24 @@ fn diff_stream_sequential_equals_concurrent(
             .block_on()
     };
     assert_eq!(diff_with_concurrency(1), diff_with_concurrency(10));
+}
+
+fn file_id_at(tree: &MergedTree, path: &RepoPath) -> FileId {
+    let value = tree
+        .path_value(path)
+        .block_on()
+        .unwrap()
+        .into_resolved()
+        .unwrap();
+    let Some(TreeValue::File {
+        id,
+        executable: _,
+        copy_id: _,
+    }) = value
+    else {
+        panic!("expected a regular file fixture");
+    };
+    id
 }
 
 /// Test that a tree built with no changes on top of an add/add conflict does
@@ -1778,18 +1797,6 @@ fn test_diff_resolved() -> TestResult {
     Ok(())
 }
 
-fn create_copy_records(paths: &[(&RepoPath, &RepoPath)]) -> CopyRecords {
-    let mut copy_records = CopyRecords::default();
-    copy_records.add_records(paths.iter().map(|&(source, target)| CopyRecord {
-        source: source.to_owned(),
-        target: target.to_owned(),
-        target_commit: CommitId::new(vec![]),
-        source_commit: CommitId::new(vec![]),
-        source_file: FileId::new(vec![]),
-    }));
-    copy_records
-}
-
 /// Diff two resolved trees
 #[test]
 fn test_diff_copy_tracing() -> TestResult {
@@ -1821,11 +1828,28 @@ fn test_diff_copy_tracing() -> TestResult {
     let before_merged = MergedTree::resolved(repo.store().clone(), before.id().clone());
     let after_merged = MergedTree::resolved(repo.store().clone(), after.id().clone());
 
-    let copy_records =
-        create_copy_records(&[(removed_path, added_path), (modified_path, copied_path)]);
+    let mut copy_records = CopyRecords::default();
+    copy_records.add_records([
+        CopyRecord {
+            source: removed_path.to_owned(),
+            target: added_path.to_owned(),
+            target_commit: CommitId::new(vec![]),
+            source_commit: CommitId::new(vec![]),
+            source_file: file_id_at(&before_merged, removed_path),
+        },
+        CopyRecord {
+            source: modified_path.to_owned(),
+            target: copied_path.to_owned(),
+            target_commit: CommitId::new(vec![]),
+            source_commit: CommitId::new(vec![]),
+            source_file: file_id_at(&before_merged, modified_path),
+        },
+    ]);
 
-    let diff: Vec<_> = before_merged
-        .diff_with_copies(&after_merged, &EverythingMatcher, &copy_records)
+    let diff: Vec<_> = copy_records
+        .bind(Diff::new(before_merged.clone(), after_merged.clone()))
+        .block_on()?
+        .diff(&EverythingMatcher)
         .map(|diff| (diff.path, diff.values.unwrap()))
         .collect()
         .block_on();
@@ -1873,6 +1897,70 @@ fn test_diff_copy_tracing() -> TestResult {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CopyRecordOrder {
+    StaleFirst,
+    ValidFirst,
+}
+
+#[test_case(CopyRecordOrder::StaleFirst; "stale record before valid record")]
+#[test_case(CopyRecordOrder::ValidFirst; "valid record before stale record")]
+fn test_diff_copy_tracing_ignores_stale_duplicate_endpoint(order: CopyRecordOrder) -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let source = repo_path("a");
+    let target = repo_path("b");
+    let before = create_single_tree(repo, &[(source, "content")]);
+    let after = create_single_tree(repo, &[(target, "content")]);
+    let before_merged = MergedTree::resolved(repo.store().clone(), before.id().clone());
+    let after_merged = MergedTree::resolved(repo.store().clone(), after.id().clone());
+
+    let stale_record = CopyRecord {
+        source: source.to_owned(),
+        target: target.to_owned(),
+        target_commit: CommitId::new(vec![]),
+        source_commit: CommitId::new(vec![]),
+        source_file: FileId::new(vec![0]),
+    };
+    let valid_record = CopyRecord {
+        source: source.to_owned(),
+        target: target.to_owned(),
+        target_commit: CommitId::new(vec![]),
+        source_commit: CommitId::new(vec![]),
+        source_file: file_id_at(&before_merged, source),
+    };
+    let duplicate_valid_record = valid_record.clone();
+    let records = match order {
+        CopyRecordOrder::StaleFirst => vec![stale_record, valid_record, duplicate_valid_record],
+        CopyRecordOrder::ValidFirst => vec![valid_record, stale_record, duplicate_valid_record],
+    };
+    let mut copy_records = CopyRecords::default();
+    copy_records.add_records(records);
+    let diffs = copy_records
+        .bind(Diff::new(before_merged.clone(), after_merged.clone()))
+        .block_on()?
+        .diff(&EverythingMatcher)
+        .map(|diff| (diff.path, diff.values.unwrap()))
+        .collect::<Vec<_>>()
+        .block_on();
+
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(
+        diffs[0],
+        (
+            CopiesTreeDiffEntryPath {
+                source: Some((source.to_owned(), CopyOperation::Rename)),
+                target: target.to_owned(),
+            },
+            Diff::new(
+                before_merged.path_value(source).block_on()?,
+                after_merged.path_value(target).block_on()?,
+            ),
+        )
+    );
+    Ok(())
+}
+
 #[test]
 fn test_diff_copy_tracing_file_and_dir() -> TestResult {
     let test_repo = TestRepo::init();
@@ -1897,13 +1985,34 @@ fn test_diff_copy_tracing_file_and_dir() -> TestResult {
             (repo_path("c/file"), "content3"),
         ],
     );
-    let copy_records = create_copy_records(&[
-        (repo_path("a"), repo_path("b")),
-        (repo_path("b/file"), repo_path("a/file")),
-        (repo_path("c"), repo_path("c/file")),
+    let mut copy_records = CopyRecords::default();
+    copy_records.add_records([
+        CopyRecord {
+            source: repo_path_buf("a"),
+            target: repo_path_buf("b"),
+            target_commit: CommitId::new(vec![]),
+            source_commit: CommitId::new(vec![]),
+            source_file: file_id_at(&before, repo_path("a")),
+        },
+        CopyRecord {
+            source: repo_path_buf("b/file"),
+            target: repo_path_buf("a/file"),
+            target_commit: CommitId::new(vec![]),
+            source_commit: CommitId::new(vec![]),
+            source_file: file_id_at(&before, repo_path("b/file")),
+        },
+        CopyRecord {
+            source: repo_path_buf("c"),
+            target: repo_path_buf("c/file"),
+            target_commit: CommitId::new(vec![]),
+            source_commit: CommitId::new(vec![]),
+            source_file: file_id_at(&before, repo_path("c")),
+        },
     ]);
-    let diff: Vec<_> = before
-        .diff_with_copies(&after, &EverythingMatcher, &copy_records)
+    let diff: Vec<_> = copy_records
+        .bind(Diff::new(before.clone(), after.clone()))
+        .block_on()?
+        .diff(&EverythingMatcher)
         .map(|diff| (diff.path, diff.values.unwrap()))
         .collect()
         .block_on();

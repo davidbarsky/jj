@@ -1192,6 +1192,32 @@ impl CommitWithSelection {
         self.selected_tree.tree_ids() == self.parent_tree.tree_ids()
     }
 
+    /// Reconstructs the source tree after removing the selected changes.
+    ///
+    /// The complete and empty selection cases preserve the original tree
+    /// transition exactly; partial selections invert the same labeled diff used
+    /// to apply the selection, so conflict terms and path moves stay paired.
+    pub async fn remaining_tree(&self) -> BackendResult<MergedTree> {
+        if self.is_full_selection() {
+            return Ok(self.parent_tree.clone());
+        }
+        if self.is_empty_selection() {
+            return Ok(self.commit.tree());
+        }
+        let selected_diff = self
+            .diff_with_labels(
+                "parents of squashed revision",
+                "selected changes for squash",
+                "squashed revision",
+            )
+            .await?;
+        MergedTree::merge(Merge::from_diffs(
+            (self.commit.tree(), self.commit.conflict_label()),
+            [selected_diff.invert()],
+        ))
+        .await
+    }
+
     /// Returns a diff of labeled trees which represents the selected changes.
     /// This can be used with `MergedTree::merge` and `Merge::from_diffs` to
     /// apply the selected changes to a tree.
@@ -1278,13 +1304,7 @@ pub async fn squash_commits<'repo>(
             repo.record_abandoned_commit(&source.commit.commit);
             abandoned_commits.push(source.commit.commit.clone());
         } else {
-            let source_tree = source.commit.commit.tree();
-            // Apply the reverse of the selected changes onto the source
-            let new_source_tree = MergedTree::merge(Merge::from_diffs(
-                (source_tree, source.commit.commit.conflict_label()),
-                [source.diff.clone().invert()],
-            ))
-            .await?;
+            let new_source_tree = source.commit.remaining_tree().await?;
             repo.rewrite_commit(&source.commit.commit)
                 .set_tree(new_source_tree)
                 .write()

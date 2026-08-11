@@ -45,6 +45,7 @@ use jj_lib::conflicts::ConflictMaterializeOptions;
 use jj_lib::copies::CopiesTreeDiffEntry;
 use jj_lib::copies::CopiesTreeDiffEntryPath;
 use jj_lib::copies::CopyRecords;
+use jj_lib::copies::CopyTransition;
 use jj_lib::evolution::CommitEvolutionEntry;
 use jj_lib::extensions_map::ExtensionsMap;
 use jj_lib::fileset;
@@ -56,7 +57,6 @@ use jj_lib::id_prefix::IdPrefixIndex;
 use jj_lib::index::IndexResult;
 use jj_lib::matchers::Matcher;
 use jj_lib::merge::Diff;
-use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::LocalRemoteRefTarget;
 use jj_lib::op_store::OperationId;
@@ -1722,10 +1722,10 @@ fn builtin_commit_evolution_entry_methods<'repo>()
                     rebase_to_dest_parent(repo.index(), &predecessors, &entry.commit).block_on()?;
                 let to_tree = entry.commit.tree();
                 Ok(TreeDiff {
-                    from_tree,
-                    to_tree,
+                    transition: CopyRecords::default()
+                        .bind(Diff::new(from_tree, to_tree))
+                        .block_on()?,
                     matcher: matcher.clone(),
-                    copy_records: CopyRecords::default(), // TODO: copy tracking
                 })
             });
             Ok(out_property.into_dyn_wrapped())
@@ -2507,10 +2507,8 @@ fn builtin_shortest_id_prefix_methods<'repo>()
 /// Pair of trees to be diffed.
 #[derive(Debug)]
 pub struct TreeDiff {
-    from_tree: MergedTree,
-    to_tree: MergedTree,
+    transition: CopyTransition,
     matcher: Rc<dyn Matcher>,
-    copy_records: CopyRecords,
 }
 
 impl TreeDiff {
@@ -2519,23 +2517,26 @@ impl TreeDiff {
         commit: &Commit,
         matcher: Rc<dyn Matcher>,
     ) -> BackendResult<Self> {
-        let mut copy_records = CopyRecords::default();
-        for parent in commit.parent_ids() {
-            let records =
-                diff_util::get_copy_records(repo.store(), parent, commit.id(), &*matcher).await?;
-            copy_records.add_records(records);
-        }
+        let copy_records = CopyRecords::collect(
+            repo.store(),
+            commit.parent_ids(),
+            std::slice::from_ref(commit.id()),
+            &*matcher,
+        )
+        .await?;
         Ok(Self {
-            from_tree: commit.parent_tree(repo.index()).await?,
-            to_tree: commit.tree(),
+            transition: copy_records
+                .bind(Diff::new(
+                    commit.parent_tree(repo.index()).await?,
+                    commit.tree(),
+                ))
+                .await?,
             matcher,
-            copy_records,
         })
     }
 
     fn diff_stream(&self) -> BoxStream<'_, CopiesTreeDiffEntry> {
-        self.from_tree
-            .diff_with_copies(&self.to_tree, &*self.matcher, &self.copy_records)
+        self.transition.diff(&*self.matcher)
     }
 
     async fn collect_entries(&self) -> BackendResult<Vec<TreeDiffEntry>> {
@@ -2577,9 +2578,12 @@ where
 {
     fn format(&self, formatter: &mut TemplateFormatter) -> io::Result<()> {
         let show = &self.show;
-        let store = self.diff.from_tree.store();
+        let store = self.diff.transition.trees().before.store();
         let tree_diff = self.diff.diff_stream();
-        let conflict_labels = Diff::new(self.diff.from_tree.labels(), self.diff.to_tree.labels());
+        let conflict_labels = Diff::new(
+            self.diff.transition.trees().before.labels(),
+            self.diff.transition.trees().after.labels(),
+        );
         show(formatter.as_mut(), store, tree_diff, conflict_labels)
             .or_else(|err| formatter.handle_error(err.into()))
     }
@@ -2727,7 +2731,7 @@ fn builtin_tree_diff_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, T
                     if let Some(max_bar_width) = max_bar_width {
                         options.max_bar_width = Some(max_bar_width);
                     }
-                    let store = diff.from_tree.store();
+                    let store = diff.transition.trees().before.store();
                     let tree_diff = diff.diff_stream();
                     let stats =
                         DiffStats::calculate(store, tree_diff, &options, &materialize_options)
@@ -2764,7 +2768,7 @@ fn builtin_tree_diff_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, T
     map
 }
 
-/// [`MergedTree`] diff entry.
+/// [`MergedTree`][jj_lib::merged_tree::MergedTree] diff entry.
 #[derive(Clone, Debug)]
 pub struct TreeDiffEntry {
     pub path: CopiesTreeDiffEntryPath,
@@ -2866,7 +2870,7 @@ fn builtin_tree_diff_entry_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'r
     map
 }
 
-/// [`MergedTree`] entry.
+/// [`MergedTree`][jj_lib::merged_tree::MergedTree] entry.
 #[derive(Clone, Debug)]
 pub struct TreeEntry {
     pub path: RepoPathBuf,

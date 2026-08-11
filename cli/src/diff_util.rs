@@ -17,7 +17,6 @@ use std::cmp::max;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::future;
 use std::io;
 use std::iter;
 use std::ops::Range;
@@ -34,8 +33,6 @@ use futures::stream::BoxStream;
 use itertools::Itertools as _;
 use jj_lib::backend::BackendError;
 use jj_lib::backend::BackendResult;
-use jj_lib::backend::CommitId;
-use jj_lib::backend::CopyRecord;
 use jj_lib::backend::MergedTreeValue;
 use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::backend::TreeValue;
@@ -481,11 +478,8 @@ impl<'a> DiffRenderer<'a> {
         copy_records: &CopyRecords,
         width: usize,
     ) -> Result<(), DiffRenderError> {
-        let diff_stream = || {
-            trees
-                .before
-                .diff_with_copies(trees.after, matcher, copy_records)
-        };
+        let transition = copy_records.bind(trees.map(Clone::clone)).await?;
+        let diff_stream = || transition.diff(matcher);
         let conflict_labels = trees.map(|tree| tree.labels());
 
         let store = self.repo.store();
@@ -655,12 +649,13 @@ impl<'a> DiffRenderer<'a> {
     ) -> Result<(), DiffRenderError> {
         let from_tree = commit.parent_tree(self.repo.index()).await?;
         let to_tree = commit.tree();
-        let mut copy_records = CopyRecords::default();
-        for parent_id in commit.parent_ids() {
-            let records =
-                get_copy_records(self.repo.store(), parent_id, commit.id(), matcher).await?;
-            copy_records.add_records(records);
-        }
+        let copy_records = CopyRecords::collect(
+            self.repo.store(),
+            commit.parent_ids(),
+            std::slice::from_ref(commit.id()),
+            matcher,
+        )
+        .await?;
         self.show_diff(
             ui,
             formatter,
@@ -671,21 +666,6 @@ impl<'a> DiffRenderer<'a> {
         )
         .await
     }
-}
-
-pub async fn get_copy_records(
-    store: &Store,
-    root: &CommitId,
-    head: &CommitId,
-    matcher: &dyn Matcher,
-) -> BackendResult<Vec<CopyRecord>> {
-    // TODO: teach backend about matching path prefixes?
-    let stream = store.get_copy_records(None, root, head)?;
-    // TODO: test record.source as well? should be AND-ed or OR-ed?
-    stream
-        .try_filter(|record| future::ready(matcher.matches(&record.target)))
-        .try_collect()
-        .await
 }
 
 /// Renders diffs between `contents` in the specified `formats`.

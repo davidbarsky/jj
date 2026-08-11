@@ -14,6 +14,7 @@ mod test_commit_concurrent;
 mod test_conflicts;
 mod test_converge;
 mod test_default_revset_graph_iterator;
+mod test_diff_selection;
 mod test_eol;
 mod test_evolution_predecessors;
 mod test_fix;

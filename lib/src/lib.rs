@@ -38,6 +38,7 @@ pub mod default_index;
 pub mod default_submodule_store;
 pub use jj_core::diff;
 pub mod diff_presentation;
+pub mod diff_selection;
 pub use jj_dsl::dsl_util;
 pub use jj_dsl::template_parser;
 pub(crate) mod eol;

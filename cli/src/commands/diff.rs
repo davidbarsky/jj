@@ -32,7 +32,6 @@ use crate::command_error::CommandError;
 use crate::command_error::user_error;
 use crate::complete;
 use crate::diff_util::DiffFormatArgs;
-use crate::diff_util::get_copy_records;
 use crate::diff_util::show_templated;
 use crate::ui::Ui;
 
@@ -125,7 +124,8 @@ pub(crate) async fn cmd_diff(
 
     let from_tree;
     let to_tree;
-    let mut copy_records = CopyRecords::default();
+    let from_commits;
+    let to_commits;
     if args.from.is_some() || args.to.is_some() {
         let resolve_revision = async |r: &Option<RevisionArg>| {
             workspace_command
@@ -137,8 +137,8 @@ pub(crate) async fn cmd_diff(
         from_tree = from.tree();
         to_tree = to.tree();
 
-        let records = get_copy_records(repo.store(), from.id(), to.id(), &matcher).await?;
-        copy_records.add_records(records);
+        from_commits = vec![from];
+        to_commits = vec![to];
     } else {
         let revision_args = args
             .revisions
@@ -183,13 +183,18 @@ pub(crate) async fn cmd_diff(
         from_tree = merge_commit_trees(repo.as_ref(), &parents).await?;
         to_tree = merge_commit_trees(repo.as_ref(), &heads).await?;
 
-        for p in &parents {
-            for to in &heads {
-                let records = get_copy_records(repo.store(), p.id(), to.id(), &matcher).await?;
-                copy_records.add_records(records);
-            }
-        }
+        from_commits = parents;
+        to_commits = heads;
     }
+    let roots = from_commits
+        .iter()
+        .map(|commit| commit.id().clone())
+        .collect::<Vec<_>>();
+    let heads = to_commits
+        .iter()
+        .map(|commit| commit.id().clone())
+        .collect::<Vec<_>>();
+    let copy_records = CopyRecords::collect(repo.store(), &roots, &heads, &matcher).await?;
 
     // -T disables both short/long rendering formats, but it might be okay to
     // enable long format if explicitly specified (assuming -T is for short or
@@ -210,7 +215,10 @@ pub(crate) async fn cmd_diff(
 
     ui.request_pager();
     if let Some(template) = &maybe_template {
-        let tree_diff = from_tree.diff_with_copies(&to_tree, &matcher, &copy_records);
+        let transition = copy_records
+            .bind(Diff::new(from_tree.clone(), to_tree.clone()))
+            .await?;
+        let tree_diff = transition.diff(&matcher);
         show_templated(ui.stdout_formatter().as_mut(), tree_diff, template).await?;
     }
     diff_renderer

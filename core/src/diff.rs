@@ -25,10 +25,13 @@ use std::ops::Range;
 use std::slice;
 
 use bstr::BStr;
+use bstr::BString;
 use hashbrown::HashTable;
 use itertools::Itertools as _;
 use smallvec::SmallVec;
 use smallvec::smallvec;
+
+use crate::merge::Diff;
 
 /// Splits `text` into lines, including the trailing newline of each line.
 pub fn find_line_ranges(text: &[u8]) -> Vec<Range<usize>> {
@@ -612,6 +615,19 @@ pub struct ContentDiff<'input> {
     unchanged_regions: Vec<UnchangedRange>,
 }
 
+/// Computes hunk ranges for exactly two inputs.
+pub struct TwoWayContentDiff {
+    unchanged_regions: Vec<UnchangedRange>,
+}
+
+/// Keeps replacement ranges bound to the two inputs against which they were
+/// validated.
+pub struct ContentDiffSelection<'input> {
+    before: &'input BStr,
+    after: &'input BStr,
+    ranges: Vec<Diff<Range<usize>>>,
+}
+
 impl<'input> ContentDiff<'input> {
     /// Compares `inputs` token by token, where `tokenizer` returns the token
     /// ranges in each input and `compare` determines whether two tokens are
@@ -787,7 +803,7 @@ impl<'input> ContentDiff<'input> {
 
     /// Returns iterator over matching and different ranges in bytes.
     pub fn hunk_ranges(&self) -> DiffHunkRangeIterator<'_> {
-        DiffHunkRangeIterator::new(self)
+        DiffHunkRangeIterator::new(&self.unchanged_regions)
     }
 
     /// Returns contents at the unchanged `range`.
@@ -872,6 +888,69 @@ impl<'input> ContentDiff<'input> {
             compacted.push(previous);
         }
         self.unchanged_regions = compacted;
+    }
+}
+
+impl TwoWayContentDiff {
+    /// Compares two inputs using complete lines, including their newlines.
+    pub fn by_line<T: AsRef<[u8]> + ?Sized>(before: &T, after: &T) -> Self {
+        let ContentDiff {
+            base_input: _,
+            other_inputs: _,
+            unchanged_regions,
+        } = ContentDiff::by_line([before, after]);
+        Self { unchanged_regions }
+    }
+
+    /// Returns byte ranges into the compared inputs in content order.
+    pub fn hunk_ranges(&self) -> DiffHunkRangeIterator<'_> {
+        DiffHunkRangeIterator::new(&self.unchanged_regions)
+    }
+}
+
+impl<'input> ContentDiffSelection<'input> {
+    /// Binds ordered replacement ranges to their input buffers without diffing them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a range is reversed, out of bounds, or overlaps or precedes the
+    /// previous range on either side.
+    pub fn new<T: AsRef<[u8]> + ?Sized>(
+        inputs: Diff<&'input T>,
+        ranges: impl IntoIterator<Item = Diff<Range<usize>>>,
+    ) -> Self {
+        let inputs = inputs.map(BStr::new);
+        let ranges = ranges.into_iter().collect::<Vec<_>>();
+        let mut previous_before_end = 0;
+        let mut previous_after_end = 0;
+        for Diff { before, after } in &ranges {
+            assert!(before.start <= before.end);
+            assert!(before.end <= inputs.before.len());
+            assert!(previous_before_end <= before.start);
+            assert!(after.start <= after.end);
+            assert!(after.end <= inputs.after.len());
+            assert!(previous_after_end <= after.start);
+            previous_before_end = before.end;
+            previous_after_end = after.end;
+        }
+        Self {
+            before: inputs.before,
+            after: inputs.after,
+            ranges,
+        }
+    }
+
+    /// Keeps the before content outside the selected replacements.
+    pub fn materialize(&self) -> BString {
+        let mut contents = BString::default();
+        let mut before_offset = 0;
+        for Diff { before, after } in &self.ranges {
+            contents.extend_from_slice(&self.before[before_offset..before.start]);
+            contents.extend_from_slice(&self.after[after.clone()]);
+            before_offset = before.end;
+        }
+        contents.extend_from_slice(&self.before[before_offset..]);
+        contents
     }
 }
 
@@ -972,8 +1051,8 @@ pub struct DiffHunkRangeIterator<'diff> {
 }
 
 impl<'diff> DiffHunkRangeIterator<'diff> {
-    fn new(diff: &'diff ContentDiff) -> Self {
-        let mut unchanged_iter = diff.unchanged_regions.iter();
+    fn new(unchanged_regions: &'diff [UnchangedRange]) -> Self {
+        let mut unchanged_iter = unchanged_regions.iter();
         let previous = unchanged_iter.next().unwrap();
         Self {
             previous,
@@ -1053,6 +1132,60 @@ mod tests {
     // `impl PartialEq<aho_corasick::util::search::Span> for std::ops::Range<usize>`
     fn no_ranges() -> Vec<Range<usize>> {
         vec![]
+    }
+
+    #[test]
+    fn test_content_diff_selection() {
+        assert_eq!(
+            ContentDiffSelection::new(Diff::new("", ""), []).materialize(),
+            ""
+        );
+        assert_eq!(
+            ContentDiffSelection::new(Diff::new("foo", "bar"), []).materialize(),
+            "foo"
+        );
+        assert_eq!(
+            ContentDiffSelection::new(Diff::new("foo", "bar"), [Diff::new(0..3, 0..3)])
+                .materialize(),
+            "bar"
+        );
+        assert_eq!(
+            ContentDiffSelection::new(
+                Diff::new(
+                    "1a\n2a\n1b\n1c\n1d\n3a\n3b\n",
+                    "1A\n2a\n1B\n1d\n3X\n3A\n3b\n3Y\n",
+                ),
+                [Diff::new(0..3, 0..3), Diff::new(6..12, 6..9)],
+            )
+            .materialize(),
+            "1A\n2a\n1B\n1d\n3a\n3b\n"
+        );
+        assert_eq!(
+            ContentDiffSelection::new(
+                Diff::new(
+                    "1a\n2a\n1b\n1c\n1d\n3a\n3b\n",
+                    "1A\n2a\n1B\n1d\n3X\n3A\n3b\n3Y\n",
+                ),
+                [Diff::new(15..18, 12..18), Diff::new(21..21, 21..24)],
+            )
+            .materialize(),
+            "1a\n2a\n1b\n1c\n1d\n3X\n3A\n3b\n3Y\n"
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_content_diff_selection_rejects_overlapping_ranges() {
+        ContentDiffSelection::new(
+            Diff::new("abcd", "ABCD"),
+            [Diff::new(0..2, 0..2), Diff::new(1..3, 2..3)],
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_content_diff_selection_rejects_out_of_bounds_ranges() {
+        ContentDiffSelection::new(Diff::new("abcd", "ABCD"), [Diff::new(0..5, 0..4)]);
     }
 
     #[test]
