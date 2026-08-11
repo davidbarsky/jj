@@ -578,25 +578,18 @@ fn build_hunk_sides(hunk: Merge<BString>, labels: &ConflictLabels) -> Merge<Hunk
     let (removes, adds) = hunk.into_removes_adds();
     let num_bases = removes.len();
     let removes = removes.enumerate().map(|(base_index, contents)| {
-        let label = labels
-            .get_remove(base_index)
-            .map(|label| label.to_owned())
-            .unwrap_or_else(|| {
-                // The vast majority of conflicts one actually tries to resolve manually have 1
-                // base.
-                if num_bases == 1 {
-                    "base".to_string()
-                } else {
-                    format!("base #{}", base_index + 1)
-                }
-            });
+        let label = match labels.get_remove(base_index) {
+            Some(label) => label.to_owned(),
+            None if num_bases == 1 => "base".to_owned(),
+            None => format!("base #{}", base_index + 1),
+        };
         HunkTerm { contents, label }
     });
     let adds = adds.enumerate().map(|(add_index, contents)| {
-        let label = labels.get_add(add_index).map_or_else(
-            || format!("side #{}", add_index + 1),
-            |label| label.to_owned(),
-        );
+        let label = match labels.get_add(add_index) {
+            Some(label) => label.to_owned(),
+            None => format!("side #{}", add_index + 1),
+        };
         HunkTerm { contents, label }
     });
     let mut hunk_terms = Merge::from_removes_adds(removes, adds);
