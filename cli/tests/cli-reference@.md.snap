@@ -281,7 +281,7 @@ Move changes from a revision into the stack of mutable revisions
 
 This command splits changes in the source revision and moves each change to the closest mutable ancestor where the corresponding lines were modified last. If the destination revision cannot be determined unambiguously, the change will be left in the source revision.
 
-With the `--interactive` option, only the selected changes will be considered for absorption. This allows picking specific hunks to absorb (which may then be distributed across multiple ancestors). The `--tool` option can be used to select a different diff editor.
+With the `--interactive` option, only the selected changes will be considered for absorption. This allows picking specific hunks to absorb (which may then be distributed across multiple ancestors). The `--tool` option can be used to select a different diff editor. The `--hunk` and `--hunk-file` options make the same selection non-interactively, using the hunk IDs listed by `jj diff --hunks -r <FROM>`.
 
 The source revision will be abandoned if all changes are absorbed into the destination revisions, and if the source revision has no description.
 
@@ -303,8 +303,14 @@ The modification made by `jj absorb` can be reviewed by `jj op show -p`.
    Only ancestors of the source revision will be considered.
 
   Default value: `mutable()`
-* `-i`, `--interactive` — Interactively choose which parts to absorb
-* `--tool <NAME>` — Specify diff editor to be used (implies --interactive)
+* `-i`, `--interactive` — Interactively choose which changes to select
+* `--tool <NAME>` — Specify the diff editor to use (implies `--interactive`)
+* `--hunk <ID[:LINES]>` — Select only the changes identified by these hunk IDs
+
+   To select only some lines of a text hunk, append `:` and the line numbers shown by `jj diff --hunks`: `-N` for a removed line and `+N` for an added line. Items can be inclusive ranges and are separated by commas, as in `ID:-2-4,+3`.
+* `--hunk-file <PATH>` — Read hunk IDs from a file (can be repeated)
+
+   The file must contain one hunk ID per line, in the same form as `--hunk`. Empty lines and lines that start with `#` are ignored. Use `-` to read from standard input. This option can be combined with `--hunk`.
 
 
 
@@ -726,7 +732,7 @@ If you want to forget a local bookmark while also untracking the corresponding r
 
 Update the description and create a new change on top [default alias: ci]
 
-When called without path arguments or `--interactive`, `jj commit` is equivalent to `jj describe` followed by `jj new`.
+When called without path arguments or selection options, `jj commit` is equivalent to `jj describe` followed by `jj new`.
 
 When using `--interactive` or path arguments, the selected changes stay in the current commit while the remaining changes are moved to a new working-copy commit on top. This is very similar to `jj split`. Differences include:
 
@@ -738,6 +744,8 @@ When using `--interactive` or path arguments, the selected changes stay in the c
 
 * `jj split` allows you to move the selected changes to a different destination with `-o`/`-A`/`-B`.
 
+With `--hunk` or `--hunk-file`, the selected changes stay in the current commit and the remaining changes move to the new working-copy commit. Use the IDs listed by `jj diff --hunks`.
+
 **Usage:** `jj commit [OPTIONS] [FILESETS]...`
 
 ###### **Arguments:**
@@ -746,8 +754,14 @@ When using `--interactive` or path arguments, the selected changes stay in the c
 
 ###### **Options:**
 
-* `-i`, `--interactive` — Interactively choose which changes to include in the current commit
-* `--tool <NAME>` — Specify diff editor to be used (implies --interactive)
+* `-i`, `--interactive` — Interactively choose which changes to select
+* `--tool <NAME>` — Specify the diff editor to use (implies `--interactive`)
+* `--hunk <ID[:LINES]>` — Select only the changes identified by these hunk IDs
+
+   To select only some lines of a text hunk, append `:` and the line numbers shown by `jj diff --hunks`: `-N` for a removed line and `+N` for an added line. Items can be inclusive ranges and are separated by commas, as in `ID:-2-4,+3`.
+* `--hunk-file <PATH>` — Read hunk IDs from a file (can be repeated)
+
+   The file must contain one hunk ID per line, in the same form as `--hunk`. Empty lines and lines that start with `#` are ignored. Use `-` to read from standard input. This option can be combined with `--hunk`.
 * `-m`, `--message <MESSAGE>` — The change description to use (don't open editor)
 * `--editor` — Open an editor to edit the change description
 
@@ -1023,6 +1037,8 @@ With the `--from` and/or `--to` options, shows the difference from/to the given 
 
 If no option is specified, it defaults to `-r @`.
 
+With `--hunk` or `--hunk-file`, only the selected hunks of the diff are shown, using the IDs listed by `--hunks` for the same revision or range. Combine this with `--git` to get a patch of just those changes. For a partial text hunk, unselected removed lines are kept, followed by the selected added lines.
+
 **Usage:** `jj diff [OPTIONS] [FILESETS]...`
 
 ###### **Arguments:**
@@ -1044,6 +1060,13 @@ If no option is specified, it defaults to `-r @`.
 * `-t`, `--to <REVSET>` — Show changes to this revision
 
    If none of `-r`, `-f`, or `-t` is provided, then the default is `-r @`.
+* `--hunks` — Show hunks with IDs for use with `--hunk`
+* `--hunk <ID[:LINES]>` — Select only the changes identified by these hunk IDs
+
+   To select only some lines of a text hunk, append `:` and the line numbers shown by `jj diff --hunks`: `-N` for a removed line and `+N` for an added line. Items can be inclusive ranges and are separated by commas, as in `ID:-2-4,+3`.
+* `--hunk-file <PATH>` — Read hunk IDs from a file (can be repeated)
+
+   The file must contain one hunk ID per line, in the same form as `--hunk`. Empty lines and lines that start with `#` are ignored. Use `-` to read from standard input. This option can be combined with `--hunk`.
 * `-T`, `--template <TEMPLATE>` — Render each file diff entry using the given template
 
    All 0-argument methods of the [`TreeDiffEntry` type][TreeDiffEntry] are available as keywords in the template expression. See [`jj help -k templates`][templates] for more information.
@@ -3100,7 +3123,9 @@ If only one of `--from` or `--into` is specified, the other one defaults to the 
 
 When neither `--from` nor `--into` is specified, the command restores into the working copy from its parent(s). `jj restore` without arguments is similar to `jj abandon`, except that it leaves an empty revision with its description and other metadata preserved.
 
-See `jj diffedit` if you'd like to restore portions of files rather than entire files.
+With `--hunk` or `--hunk-file`, only the selected changes are undone. The IDs are those `jj diff --hunks` lists for the same revisions: `jj diff --hunks -r <REV>` for `--changes-in <REV>`, and `jj diff --hunks --from <FROM> --to <INTO>` for `--from`/`--into`. Selecting a removed line restores it; selecting an added line removes it. Unselected changes remain in the destination.
+
+Use `--interactive` to choose changes with a diff editor. See `jj diffedit` to edit the destination content directly.
 
 **Usage:** `jj restore [OPTIONS] [FILESETS]...`
 
@@ -3117,8 +3142,14 @@ See `jj diffedit` if you'd like to restore portions of files rather than entire 
    This undoes the changes that can be seen with `jj diff -r REVSET`. If `REVSET` only has a single parent, this option is equivalent to `jj restore --into REVSET --from REVSET-`.
 
    The default behavior of `jj restore` is equivalent to `jj restore --changes-in @`.
-* `-i`, `--interactive` — Interactively choose which parts to restore
-* `--tool <NAME>` — Specify diff editor to be used (implies --interactive)
+* `-i`, `--interactive` — Interactively choose which changes to select
+* `--tool <NAME>` — Specify the diff editor to use (implies `--interactive`)
+* `--hunk <ID[:LINES]>` — Select only the changes identified by these hunk IDs
+
+   To select only some lines of a text hunk, append `:` and the line numbers shown by `jj diff --hunks`: `-N` for a removed line and `+N` for an added line. Items can be inclusive ranges and are separated by commas, as in `ID:-2-4,+3`.
+* `--hunk-file <PATH>` — Read hunk IDs from a file (can be repeated)
+
+   The file must contain one hunk ID per line, in the same form as `--hunk`. Empty lines and lines that start with `#` are ignored. Use `-` to read from standard input. This option can be combined with `--hunk`.
 * `--restore-descendants` — Preserve the content (not the diff) when rebasing descendants
 
 
@@ -3373,6 +3404,9 @@ Split a revision in two
 Starts a [diff editor] on the changes in the revision. Edit the right side
 of the diff until it has the content you want in the first commit. Once you
 close the editor, your revision will be split into two commits.
+With `--hunk` or `--hunk-file`, no editor is started. The selected changes
+go into the first commit, and the remaining changes go into the second.
+Use the IDs listed by `jj diff --hunks -r <REV>`.
 
 [diff editor]:
     https://docs.jj-vcs.dev/latest/config/#editing-diffs
@@ -3430,10 +3464,14 @@ achieved with `jj new`.
 
 ###### **Options:**
 
-* `-i`, `--interactive` — Interactively choose which parts to split
+* `-i`, `--interactive` — Interactively choose which changes to select
+* `--tool <NAME>` — Specify the diff editor to use (implies `--interactive`)
+* `--hunk <ID[:LINES]>` — Select only the changes identified by these hunk IDs
 
-   This is the default if no filesets are provided.
-* `--tool <NAME>` — Specify diff editor to be used (implies --interactive)
+   To select only some lines of a text hunk, append `:` and the line numbers shown by `jj diff --hunks`: `-N` for a removed line and `+N` for an added line. Items can be inclusive ranges and are separated by commas, as in `ID:-2-4,+3`.
+* `--hunk-file <PATH>` — Read hunk IDs from a file (can be repeated)
+
+   The file must contain one hunk ID per line, in the same form as `--hunk`. Empty lines and lines that start with `#` are ignored. Use `-` to read from standard input. This option can be combined with `--hunk`.
 * `-r`, `--revision <REVSET>` — The revision to split
 
   Default value: `@`
@@ -3466,7 +3504,9 @@ With the `-r` option, moves the changes from the specified revision to the paren
 
 With the `--from` and/or `--into` options, moves changes from/to the given revisions. If either is left out, it defaults to the working-copy commit. For example, `jj squash --into @--` moves changes from the working-copy commit to the grandparent.
 
-If, after moving changes out, the source revision is empty compared to its parent(s), and `--keep-emptied` is not set, it will be abandoned. Without `--interactive` or paths, the source revision will always be empty.
+If, after moving changes out, the source revision is empty compared to its parent(s), and `--keep-emptied` is not set, it will be abandoned. Without selection options or paths, the source revision will always be empty.
+
+With `--hunk` or `--hunk-file`, only the selected changes move to the destination. The remaining changes stay in the source revisions. Use the IDs listed by `jj diff --hunks -r <SOURCE>`.
 
 If the source was abandoned and both the source and destination had a non-empty description, you will be asked for the combined description. If either was empty, then the other one will be used.
 
@@ -3497,8 +3537,14 @@ An alternative squashing UI is available via the `-o`, `-A`, and `-B` options. U
 * `--editor` — Open an editor to edit the change description
 
    Forces an editor to open when using `--message` to allow the message to be edited afterwards.
-* `-i`, `--interactive` — Interactively choose which parts to squash
-* `--tool <NAME>` — Specify diff editor to be used (implies --interactive)
+* `-i`, `--interactive` — Interactively choose which changes to select
+* `--tool <NAME>` — Specify the diff editor to use (implies `--interactive`)
+* `--hunk <ID[:LINES]>` — Select only the changes identified by these hunk IDs
+
+   To select only some lines of a text hunk, append `:` and the line numbers shown by `jj diff --hunks`: `-N` for a removed line and `+N` for an added line. Items can be inclusive ranges and are separated by commas, as in `ID:-2-4,+3`.
+* `--hunk-file <PATH>` — Read hunk IDs from a file (can be repeated)
+
+   The file must contain one hunk ID per line, in the same form as `--hunk`. Empty lines and lines that start with `#` are ignored. Use `-` to read from standard input. This option can be combined with `--hunk`.
 * `-k`, `--keep-emptied` — The source revision will not be abandoned
 
 

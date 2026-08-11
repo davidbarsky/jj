@@ -14,12 +14,11 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 
-use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
+use jj_lib::diff_selection::DiffSelectionSource;
 use jj_lib::matchers::Matcher;
-use jj_lib::merge::Diff;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
@@ -37,7 +36,11 @@ use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::DiffSelector;
+use crate::cli_util::HunkSelectionArgs;
+use crate::cli_util::RemainingHunkSummary;
 use crate::cli_util::RevisionArg;
+use crate::cli_util::SelectionDefault;
+use crate::cli_util::SelectionMode;
 use crate::cli_util::WorkspaceCommandHelper;
 use crate::cli_util::WorkspaceCommandTransaction;
 use crate::cli_util::compute_commit_location;
@@ -54,6 +57,9 @@ use crate::ui::Ui;
 /// Starts a [diff editor] on the changes in the revision. Edit the right side
 /// of the diff until it has the content you want in the first commit. Once you
 /// close the editor, your revision will be split into two commits.
+/// With `--hunk` or `--hunk-file`, no editor is started. The selected changes
+/// go into the first commit, and the remaining changes go into the second.
+/// Use the IDs listed by `jj diff --hunks -r <REV>`.
 ///
 /// [diff editor]:
 ///     https://docs.jj-vcs.dev/latest/config/#editing-diffs
@@ -105,16 +111,8 @@ use crate::ui::Ui;
 #[derive(clap::Args, Clone, Debug)]
 #[command(verbatim_doc_comment)]
 pub(crate) struct SplitArgs {
-    /// Interactively choose which parts to split
-    ///
-    /// This is the default if no filesets are provided.
-    #[arg(long, short)]
-    interactive: bool,
-
-    /// Specify diff editor to be used (implies --interactive)
-    #[arg(long, value_name = "NAME")]
-    #[arg(add = ArgValueCandidates::new(complete::diff_editors))]
-    tool: Option<String>,
+    #[command(flatten)]
+    hunk_selection: HunkSelectionArgs,
 
     /// The revision to split
     #[arg(long, short, default_value = "@", value_name = "REVSET")]
@@ -203,6 +201,7 @@ impl SplitArgs {
         &self,
         ui: &Ui,
         workspace_command: &WorkspaceCommandHelper,
+        selection_mode: SelectionMode,
     ) -> Result<ResolvedSplitArgs, CommandError> {
         let target_commit = workspace_command
             .resolve_single_rev(ui, &self.revision)
@@ -213,11 +212,7 @@ impl SplitArgs {
         let repo = workspace_command.repo();
         let fileset_expression = workspace_command.parse_file_patterns(ui, &self.paths)?;
         let matcher = fileset_expression.to_matcher();
-        let diff_selector = workspace_command.diff_selector(
-            ui,
-            self.tool.as_deref(),
-            self.interactive || self.paths.is_empty(),
-        )?;
+        let diff_selector = workspace_command.diff_selector(ui, selection_mode)?;
         let use_move_flags =
             self.onto.is_some() || self.insert_after.is_some() || self.insert_before.is_some();
         let (new_parent_ids, new_child_ids) = if use_move_flags {
@@ -274,6 +269,14 @@ pub(crate) async fn cmd_split(
     command: &CommandHelper,
     args: &SplitArgs,
 ) -> Result<(), CommandError> {
+    let selection_mode = args.hunk_selection.resolve(
+        command.cwd(),
+        if args.paths.is_empty() {
+            SelectionDefault::Interactive
+        } else {
+            SelectionDefault::Everything
+        },
+    )?;
     let mut workspace_command = command.workspace_helper(ui).await?;
     let ResolvedSplitArgs {
         target_commit,
@@ -283,7 +286,7 @@ pub(crate) async fn cmd_split(
         use_move_flags,
         new_parent_ids,
         new_child_ids,
-    } = args.resolve(ui, &workspace_command).await?;
+    } = args.resolve(ui, &workspace_command, selection_mode).await?;
     let text_editor = workspace_command.text_editor()?;
     let mut tx = workspace_command.start_transaction();
 
@@ -416,8 +419,15 @@ pub(crate) async fn cmd_split(
         tx.write_commit_summary(formatter.as_mut(), &second_commit)?;
         writeln!(formatter)?;
     }
+    let mut remaining_hunk_summary = RemainingHunkSummary::default();
+    if let DiffSelector::Hunks(_) = &diff_selector {
+        remaining_hunk_summary
+            .add_commit_tree(tx.repo(), &second_commit, second_commit.tree())
+            .await?;
+    }
     tx.finish(ui, format!("split commit {}", target.commit.id().hex()))
         .await?;
+    workspace_command.print_remaining_hunk_summary(ui, &remaining_hunk_summary)?;
     Ok(())
 }
 
@@ -569,11 +579,9 @@ The changes that are not selected will replace the original commit.
     let selected_tree = diff_selector
         .select(
             ui,
-            Diff::new(&parent_tree, &target_commit.tree()),
-            Diff::new(
-                target_commit.parents_conflict_label().await?,
-                target_commit.conflict_label(),
-            ),
+            DiffSelectionSource::Commit(target_commit)
+                .capture(tx.repo())
+                .await?,
             matcher,
             format_instructions,
         )

@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use indoc::writedoc;
-use jj_lib::merge::Diff;
+use jj_lib::diff_selection::DiffSelectionSource;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
+use crate::cli_util::DiffSelector;
+use crate::cli_util::HunkSelectionArgs;
+use crate::cli_util::RemainingHunkSummary;
+use crate::cli_util::SelectionDefault;
 use crate::command_error::CommandError;
 use crate::command_error::user_error;
 use crate::complete;
@@ -32,7 +35,7 @@ use crate::ui::Ui;
 
 /// Update the description and create a new change on top [default alias: ci]
 ///
-/// When called without path arguments or `--interactive`, `jj commit` is
+/// When called without path arguments or selection options, `jj commit` is
 /// equivalent to `jj describe` followed by `jj new`.
 ///
 /// When using `--interactive` or path arguments, the selected changes stay in
@@ -51,16 +54,14 @@ use crate::ui::Ui;
 ///
 /// * `jj split` allows you to move the selected changes to a different
 ///   destination with `-o`/`-A`/`-B`.
+///
+/// With `--hunk` or `--hunk-file`, the selected changes stay in the current
+/// commit and the remaining changes move to the new working-copy commit.
+/// Use the IDs listed by `jj diff --hunks`.
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct CommitArgs {
-    /// Interactively choose which changes to include in the current commit
-    #[arg(short, long)]
-    interactive: bool,
-
-    /// Specify diff editor to be used (implies --interactive)
-    #[arg(long, value_name = "NAME")]
-    #[arg(add = ArgValueCandidates::new(complete::diff_editors))]
-    tool: Option<String>,
+    #[command(flatten)]
+    hunk_selection: HunkSelectionArgs,
 
     /// The change description to use (don't open editor)
     #[arg(long = "message", short, value_name = "MESSAGE")]
@@ -85,6 +86,9 @@ pub(crate) async fn cmd_commit(
     command: &CommandHelper,
     args: &CommitArgs,
 ) -> Result<(), CommandError> {
+    let selection_mode = args
+        .hunk_selection
+        .resolve(command.cwd(), SelectionDefault::Everything)?;
     let mut workspace_command = command.workspace_helper(ui).await?;
 
     let commit = workspace_command
@@ -96,8 +100,7 @@ pub(crate) async fn cmd_commit(
         .to_matcher();
     let advanceable_bookmarks =
         workspace_command.get_advanceable_bookmarks(ui, commit.parent_ids())?;
-    let diff_selector =
-        workspace_command.diff_selector(ui, args.tool.as_deref(), args.interactive)?;
+    let diff_selector = workspace_command.diff_selector(ui, selection_mode)?;
     let text_editor = workspace_command.text_editor()?;
     let mut tx = workspace_command.start_transaction();
     let base_tree = commit.parent_tree(tx.repo().index()).await?;
@@ -116,11 +119,9 @@ new working-copy commit.
     let tree = diff_selector
         .select(
             ui,
-            Diff::new(&base_tree, &commit.tree()),
-            Diff::new(
-                commit.parents_conflict_label().await?,
-                commit.conflict_label(),
-            ),
+            DiffSelectionSource::Commit(&commit)
+                .capture(tx.repo())
+                .await?,
             matcher.as_ref(),
             format_instructions,
         )
@@ -174,6 +175,7 @@ new working-copy commit.
     commit_builder.set_description(description);
     let new_commit = commit_builder.write(tx.repo_mut()).await?;
 
+    let mut remaining_hunk_summary = RemainingHunkSummary::default();
     let workspace_names = tx.repo().view().workspaces_for_wc_commit_id(commit.id());
     if !workspace_names.is_empty() {
         let new_wc_commit = tx
@@ -189,8 +191,14 @@ new working-copy commit.
         for name in workspace_names {
             tx.repo_mut().edit(name, &new_wc_commit).await.unwrap();
         }
+        if let DiffSelector::Hunks(_) = &diff_selector {
+            remaining_hunk_summary
+                .add_commit_tree(tx.repo(), &new_wc_commit, new_wc_commit.tree())
+                .await?;
+        }
     }
     tx.finish(ui, format!("commit {}", commit.id().hex()))
         .await?;
+    workspace_command.print_remaining_hunk_summary(ui, &remaining_hunk_summary)?;
     Ok(())
 }

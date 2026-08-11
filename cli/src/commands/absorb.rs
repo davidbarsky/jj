@@ -12,19 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use indoc::formatdoc;
 use jj_lib::absorb::AbsorbSource;
 use jj_lib::absorb::absorb_hunks;
 use jj_lib::absorb::split_hunks_to_trees;
+use jj_lib::diff_selection::DiffSelectionSource;
 use jj_lib::matchers::EverythingMatcher;
-use jj_lib::merge::Diff;
 use jj_lib::repo::Repo as _;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
+use crate::cli_util::DiffSelector;
+use crate::cli_util::HunkSelectionArgs;
 use crate::cli_util::RevisionArg;
+use crate::cli_util::SelectionDefault;
 use crate::cli_util::print_unmatched_explicit_paths;
 use crate::cli_util::print_updated_commits;
 use crate::command_error::CommandError;
@@ -43,7 +45,9 @@ use crate::ui::Ui;
 /// With the `--interactive` option, only the selected changes will be
 /// considered for absorption. This allows picking specific hunks to absorb
 /// (which may then be distributed across multiple ancestors). The `--tool`
-/// option can be used to select a different diff editor.
+/// option can be used to select a different diff editor. The `--hunk` and
+/// `--hunk-file` options make the same selection non-interactively, using the
+/// hunk IDs listed by `jj diff --hunks -r <FROM>`.
 ///
 /// The source revision will be abandoned if all changes are absorbed into the
 /// destination revisions, and if the source revision has no description.
@@ -74,14 +78,8 @@ pub(crate) struct AbsorbArgs {
     #[arg(add = ArgValueCompleter::new(complete::modified_from_files))]
     paths: Vec<String>,
 
-    /// Interactively choose which parts to absorb
-    #[arg(long, short)]
-    interactive: bool,
-
-    /// Specify diff editor to be used (implies --interactive)
-    #[arg(long, value_name = "NAME")]
-    #[arg(add = ArgValueCandidates::new(complete::diff_editors))]
-    tool: Option<String>,
+    #[command(flatten)]
+    hunk_selection: HunkSelectionArgs,
 }
 
 #[instrument(skip_all)]
@@ -90,6 +88,9 @@ pub(crate) async fn cmd_absorb(
     command: &CommandHelper,
     args: &AbsorbArgs,
 ) -> Result<(), CommandError> {
+    let selection_mode = args
+        .hunk_selection
+        .resolve(command.cwd(), SelectionDefault::Everything)?;
     let mut workspace_command = command.workspace_helper(ui).await?;
 
     let source_commit = workspace_command.resolve_single_rev(ui, &args.from).await?;
@@ -108,14 +109,16 @@ pub(crate) async fn cmd_absorb(
     )
     .await?;
 
-    let diff_selector =
-        workspace_command.diff_selector(ui, args.tool.as_deref(), args.interactive)?;
+    let diff_selector = workspace_command.diff_selector(ui, selection_mode)?;
     let repo = workspace_command.repo().as_ref();
-    let source = if diff_selector.is_interactive() {
-        let parent_tree = source_commit.parent_tree(repo.index()).await?;
-        let source_tree = source_commit.tree();
-        let format_instructions = || {
-            formatdoc! {"
+    let source = match &diff_selector {
+        DiffSelector::NonInteractive => {
+            AbsorbSource::from_commit(repo, source_commit.clone()).await?
+        }
+        DiffSelector::Interactive(_) | DiffSelector::Hunks(_) => {
+            let parent_tree = source_commit.parent_tree(repo.index()).await?;
+            let format_instructions = || {
+                formatdoc! {"
                 You are selecting changes from: {source} to be considered for
                 absorption into ancestors.
 
@@ -128,27 +131,24 @@ pub(crate) async fn cmd_absorb(
                 (using annotation). Any hunks that cannot be absorbed unambiguously
                 remain in the source commit.
                 ",
-                source = workspace_command.format_commit_summary(&source_commit),
+                    source = workspace_command.format_commit_summary(&source_commit),
+                }
+            };
+            let selected_tree = diff_selector
+                .select(
+                    ui,
+                    DiffSelectionSource::Commit(&source_commit)
+                        .capture(repo)
+                        .await?,
+                    &matcher,
+                    format_instructions,
+                )
+                .await?;
+            if selected_tree.tree_ids() == parent_tree.tree_ids() {
+                return Err(user_error("No changes selected"));
             }
-        };
-        let selected_tree = diff_selector
-            .select(
-                ui,
-                Diff::new(&parent_tree, &source_tree),
-                Diff::new(
-                    source_commit.parents_conflict_label().await?,
-                    source_commit.conflict_label(),
-                ),
-                &matcher,
-                format_instructions,
-            )
-            .await?;
-        if selected_tree.tree_ids() == parent_tree.tree_ids() {
-            return Err(user_error("No changes selected"));
+            AbsorbSource::from_tree(source_commit.clone(), selected_tree, parent_tree).await?
         }
-        AbsorbSource::from_tree(source_commit.clone(), selected_tree, parent_tree).await?
-    } else {
-        AbsorbSource::from_commit(repo, source_commit.clone()).await?
     };
 
     let selected_trees = split_hunks_to_trees(repo, &source, &destinations, &matcher).await?;

@@ -17,6 +17,7 @@ use std::cmp::max;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::future;
 use std::io;
 use std::iter;
 use std::ops::Range;
@@ -33,6 +34,7 @@ use futures::stream::BoxStream;
 use itertools::Itertools as _;
 use jj_lib::backend::BackendError;
 use jj_lib::backend::BackendResult;
+use jj_lib::backend::CommitId;
 use jj_lib::backend::MergedTreeValue;
 use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::backend::TreeValue;
@@ -45,6 +47,7 @@ use jj_lib::conflicts::ConflictMaterializeOptions;
 use jj_lib::conflicts::MaterializedTreeDiffEntry;
 use jj_lib::conflicts::MaterializedTreeValue;
 use jj_lib::conflicts::materialize_merge_result_to_bytes;
+use jj_lib::conflicts::materialize_tree_value;
 use jj_lib::conflicts::materialized_diff_stream;
 use jj_lib::copies::CopiesTreeDiffEntry;
 use jj_lib::copies::CopiesTreeDiffEntryPath;
@@ -63,6 +66,10 @@ use jj_lib::diff_presentation::unified::UnifiedDiffError;
 use jj_lib::diff_presentation::unified::git_diff_part;
 use jj_lib::diff_presentation::unified::unified_diff_hunks;
 use jj_lib::diff_presentation::unzip_diff_hunks_to_lines;
+use jj_lib::diff_selection::DiffHunkId;
+use jj_lib::diff_selection::DiffSelection;
+use jj_lib::diff_selection::HunkPresentation;
+use jj_lib::diff_selection::TextHunkPresentation;
 use jj_lib::files;
 use jj_lib::files::ConflictDiffHunk;
 use jj_lib::files::DiffLineHunkSide;
@@ -770,6 +777,25 @@ pub struct ColorWordsDiffOptions {
     pub max_inline_alternation: Option<usize>,
 }
 
+fn write_color_words_hunk_header(
+    formatter: &mut dyn Formatter,
+    id: DiffHunkId,
+    source: Option<&CommitId>,
+) -> io::Result<()> {
+    writeln!(formatter)?;
+    let mut formatter = formatter.labeled("hunk_header");
+    write!(formatter.labeled("keyword"), "hunk")?;
+    write!(formatter, " ")?;
+    write!(formatter.labeled("id"), "{id}")?;
+    match source {
+        Some(source) => {
+            write!(formatter, " ")?;
+            writeln!(formatter.labeled("source"), "source={source}")
+        }
+        None => writeln!(formatter),
+    }
+}
+
 impl ColorWordsDiffOptions {
     pub fn from_settings(settings: &UserSettings) -> Result<Self, ConfigGetError> {
         let max_inline_alternation = {
@@ -791,7 +817,7 @@ impl ColorWordsDiffOptions {
         })
     }
 
-    fn merge_args(&mut self, args: &DiffFormatArgs) {
+    pub(crate) fn merge_args(&mut self, args: &DiffFormatArgs) {
         if let Some(context) = args.context {
             self.context = context;
         }
@@ -1469,7 +1495,7 @@ fn basic_diff_file_type(value: &MaterializedTreeValue) -> &'static str {
     }
 }
 
-pub async fn show_color_words_diff(
+pub(crate) async fn show_color_words_diff(
     formatter: &mut dyn Formatter,
     store: &Store,
     tree_diff: BoxStream<'_, CopiesTreeDiffEntry>,
@@ -1478,164 +1504,360 @@ pub async fn show_color_words_diff(
     options: &ColorWordsDiffOptions,
     materialize_options: &ConflictMaterializeOptions,
 ) -> Result<(), DiffRenderError> {
-    let empty_content = || Merge::resolved(BString::default());
     let mut diff_stream = materialized_diff_stream(store, tree_diff, conflict_labels);
     while let Some(MaterializedTreeDiffEntry { path, values }) = diff_stream.next().await {
-        let left_path = path.source();
-        let right_path = path.target();
-        let left_ui_path = path_converter.format_file_path(left_path);
-        let right_ui_path = path_converter.format_file_path(right_path);
-        let language = right_path
-            .components()
-            .next_back()
-            .and_then(|name| SourceLanguage::from_file_name(name.as_internal_str()))
-            .or(Some(SourceLanguage::Generic));
-        let Diff {
-            before: left_value,
-            after: right_value,
-        } = values?;
+        show_color_words_materialized_entry(
+            formatter,
+            &path,
+            values?,
+            path_converter,
+            options,
+            materialize_options,
+        )
+        .await?;
+    }
+    Ok(())
+}
 
-        match (&left_value, &right_value) {
-            (MaterializedTreeValue::AccessDenied(source), _) => {
-                write!(
-                    formatter.labeled("access-denied"),
-                    "Access denied to {left_ui_path}:"
-                )?;
-                writeln!(formatter, " {source}")?;
-                continue;
-            }
-            (_, MaterializedTreeValue::AccessDenied(source)) => {
-                write!(
-                    formatter.labeled("access-denied"),
-                    "Access denied to {right_ui_path}:"
-                )?;
-                writeln!(formatter, " {source}")?;
-                continue;
-            }
-            _ => {}
+async fn show_color_words_materialized_entry(
+    formatter: &mut dyn Formatter,
+    path: &CopiesTreeDiffEntryPath,
+    values: Diff<MaterializedTreeValue>,
+    path_converter: &RepoPathUiConverter,
+    options: &ColorWordsDiffOptions,
+    materialize_options: &ConflictMaterializeOptions,
+) -> Result<(), DiffRenderError> {
+    let empty_content = || Merge::resolved(BString::default());
+    let left_path = path.source();
+    let right_path = path.target();
+    let left_ui_path = path_converter.format_file_path(left_path);
+    let right_ui_path = path_converter.format_file_path(right_path);
+    let language = right_path
+        .components()
+        .next_back()
+        .and_then(|name| SourceLanguage::from_file_name(name.as_internal_str()))
+        .or(Some(SourceLanguage::Generic));
+    let Diff {
+        before: left_value,
+        after: right_value,
+    } = values;
+    match (&left_value, &right_value) {
+        (MaterializedTreeValue::AccessDenied(source), _) => {
+            write!(
+                formatter.labeled("access-denied"),
+                "Access denied to {left_ui_path}:"
+            )?;
+            writeln!(formatter, " {source}")?;
+            return Ok(());
         }
-        if left_value.is_absent() {
-            let description = basic_diff_file_type(&right_value);
-            writeln!(
-                formatter.labeled("header"),
-                "Added {description} {right_ui_path}:"
+        (_, MaterializedTreeValue::AccessDenied(source)) => {
+            write!(
+                formatter.labeled("access-denied"),
+                "Access denied to {right_ui_path}:"
             )?;
-            let right_content = diff_content_as_merge(right_path, right_value).await?;
-            if right_content.contents.is_empty() {
-                writeln!(formatter.labeled("empty"), "    (empty)")?;
-            } else if right_content.is_binary {
-                writeln!(formatter.labeled("binary"), "    (binary)")?;
-            } else {
-                show_color_words_diff_hunks(
-                    formatter,
-                    language,
-                    Diff::new(&empty_content(), &right_content.contents.file_content),
-                    Diff::new(
-                        &ConflictLabels::unlabeled(),
-                        &right_content.contents.conflict_labels,
-                    ),
-                    options,
-                    materialize_options,
-                )?;
-            }
-        } else if right_value.is_present() {
-            let description = match (&left_value, &right_value) {
-                (MaterializedTreeValue::File(left), MaterializedTreeValue::File(right)) => {
-                    if left.executable && right.executable {
-                        "Modified executable file".to_string()
-                    } else if left.executable {
-                        "Executable file became non-executable at".to_string()
-                    } else if right.executable {
-                        "Non-executable file became executable at".to_string()
-                    } else {
-                        "Modified regular file".to_string()
-                    }
-                }
-                (
-                    MaterializedTreeValue::FileConflict(_)
-                    | MaterializedTreeValue::OtherConflict { .. },
-                    MaterializedTreeValue::FileConflict(_)
-                    | MaterializedTreeValue::OtherConflict { .. },
-                ) => "Modified conflict in".to_string(),
-                (
-                    MaterializedTreeValue::FileConflict(_)
-                    | MaterializedTreeValue::OtherConflict { .. },
-                    _,
-                ) => "Resolved conflict in".to_string(),
-                (
-                    _,
-                    MaterializedTreeValue::FileConflict(_)
-                    | MaterializedTreeValue::OtherConflict { .. },
-                ) => "Created conflict in".to_string(),
-                (MaterializedTreeValue::Symlink { .. }, MaterializedTreeValue::Symlink { .. }) => {
-                    "Symlink target changed at".to_string()
-                }
-                (_, _) => {
-                    let left_type = basic_diff_file_type(&left_value);
-                    let right_type = basic_diff_file_type(&right_value);
-                    let (first, rest) = left_type.split_at(1);
-                    format!(
-                        "{}{} became {} at",
-                        first.to_ascii_uppercase(),
-                        rest,
-                        right_type
-                    )
-                }
-            };
-            let left_content = diff_content_as_merge(left_path, left_value).await?;
-            let right_content = diff_content_as_merge(right_path, right_value).await?;
-            if left_path == right_path {
-                writeln!(
-                    formatter.labeled("header"),
-                    "{description} {right_ui_path}:"
-                )?;
-            } else {
-                writeln!(
-                    formatter.labeled("header"),
-                    "{description} {right_ui_path} ({left_ui_path} => {right_ui_path}):"
-                )?;
-            }
-            if left_content.is_binary || right_content.is_binary {
-                writeln!(formatter.labeled("binary"), "    (binary)")?;
-            } else if left_content.contents != right_content.contents {
-                show_color_words_diff_hunks(
-                    formatter,
-                    language,
-                    Diff::new(
-                        &left_content.contents.file_content,
-                        &right_content.contents.file_content,
-                    ),
-                    Diff::new(
-                        &left_content.contents.conflict_labels,
-                        &right_content.contents.conflict_labels,
-                    ),
-                    options,
-                    materialize_options,
-                )?;
-            }
+            writeln!(formatter, " {source}")?;
+            return Ok(());
+        }
+        _ => {}
+    }
+    if left_value.is_absent() {
+        let description = basic_diff_file_type(&right_value);
+        writeln!(
+            formatter.labeled("header"),
+            "Added {description} {right_ui_path}:"
+        )?;
+        let right_content = diff_content_as_merge(right_path, right_value).await?;
+        if right_content.contents.is_empty() {
+            writeln!(formatter.labeled("empty"), "    (empty)")?;
+        } else if right_content.is_binary {
+            writeln!(formatter.labeled("binary"), "    (binary)")?;
         } else {
-            let description = basic_diff_file_type(&left_value);
+            show_color_words_diff_hunks(
+                formatter,
+                language,
+                Diff::new(&empty_content(), &right_content.contents.file_content),
+                Diff::new(
+                    &ConflictLabels::unlabeled(),
+                    &right_content.contents.conflict_labels,
+                ),
+                options,
+                materialize_options,
+            )?;
+        }
+    } else if right_value.is_present() {
+        let description = match (&left_value, &right_value) {
+            (MaterializedTreeValue::File(left), MaterializedTreeValue::File(right)) => {
+                if left.executable && right.executable {
+                    "Modified executable file".to_string()
+                } else if left.executable {
+                    "Executable file became non-executable at".to_string()
+                } else if right.executable {
+                    "Non-executable file became executable at".to_string()
+                } else {
+                    "Modified regular file".to_string()
+                }
+            }
+            (
+                MaterializedTreeValue::FileConflict(_)
+                | MaterializedTreeValue::OtherConflict { .. },
+                MaterializedTreeValue::FileConflict(_)
+                | MaterializedTreeValue::OtherConflict { .. },
+            ) => "Modified conflict in".to_string(),
+            (
+                MaterializedTreeValue::FileConflict(_)
+                | MaterializedTreeValue::OtherConflict { .. },
+                _,
+            ) => "Resolved conflict in".to_string(),
+            (
+                _,
+                MaterializedTreeValue::FileConflict(_)
+                | MaterializedTreeValue::OtherConflict { .. },
+            ) => "Created conflict in".to_string(),
+            (MaterializedTreeValue::Symlink { .. }, MaterializedTreeValue::Symlink { .. }) => {
+                "Symlink target changed at".to_string()
+            }
+            (_, _) => {
+                let left_type = basic_diff_file_type(&left_value);
+                let right_type = basic_diff_file_type(&right_value);
+                let (first, rest) = left_type.split_at(1);
+                format!(
+                    "{}{} became {} at",
+                    first.to_ascii_uppercase(),
+                    rest,
+                    right_type
+                )
+            }
+        };
+        let left_content = diff_content_as_merge(left_path, left_value).await?;
+        let right_content = diff_content_as_merge(right_path, right_value).await?;
+        if left_path == right_path {
             writeln!(
                 formatter.labeled("header"),
-                "Removed {description} {right_ui_path}:"
+                "{description} {right_ui_path}:"
             )?;
-            let left_content = diff_content_as_merge(left_path, left_value).await?;
-            if left_content.contents.is_empty() {
-                writeln!(formatter.labeled("empty"), "    (empty)")?;
-            } else if left_content.is_binary {
-                writeln!(formatter.labeled("binary"), "    (binary)")?;
-            } else {
-                show_color_words_diff_hunks(
+        } else {
+            writeln!(
+                formatter.labeled("header"),
+                "{description} {right_ui_path} ({left_ui_path} => {right_ui_path}):"
+            )?;
+        }
+        if left_content.is_binary || right_content.is_binary {
+            writeln!(formatter.labeled("binary"), "    (binary)")?;
+        } else if left_content.contents != right_content.contents {
+            show_color_words_diff_hunks(
+                formatter,
+                language,
+                Diff::new(
+                    &left_content.contents.file_content,
+                    &right_content.contents.file_content,
+                ),
+                Diff::new(
+                    &left_content.contents.conflict_labels,
+                    &right_content.contents.conflict_labels,
+                ),
+                options,
+                materialize_options,
+            )?;
+        }
+    } else {
+        let description = basic_diff_file_type(&left_value);
+        writeln!(
+            formatter.labeled("header"),
+            "Removed {description} {right_ui_path}:"
+        )?;
+        let left_content = diff_content_as_merge(left_path, left_value).await?;
+        if left_content.contents.is_empty() {
+            writeln!(formatter.labeled("empty"), "    (empty)")?;
+        } else if left_content.is_binary {
+            writeln!(formatter.labeled("binary"), "    (binary)")?;
+        } else {
+            show_color_words_diff_hunks(
+                formatter,
+                language,
+                Diff::new(&left_content.contents.file_content, &empty_content()),
+                Diff::new(
+                    &left_content.contents.conflict_labels,
+                    &ConflictLabels::unlabeled(),
+                ),
+                options,
+                materialize_options,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum HunkSourceDisplay {
+    Show,
+    Hide,
+}
+
+pub(crate) async fn show_color_words_diff_for_selection(
+    formatter: &mut dyn Formatter,
+    store: &Store,
+    plan: &DiffSelection,
+    path_converter: &RepoPathUiConverter,
+    options: &ColorWordsDiffOptions,
+    marker_style: ConflictMarkerStyle,
+    source_display: HunkSourceDisplay,
+) -> Result<(), DiffRenderError> {
+    let materialize_options = ConflictMaterializeOptions {
+        marker_style,
+        marker_len: None,
+        merge: store.merge_options().clone(),
+    };
+    let source = match source_display {
+        HunkSourceDisplay::Show => plan.hunk_source(),
+        HunkSourceDisplay::Hide => None,
+    };
+    let labels = plan.tree_labels().map(|(_, labels)| labels);
+    let mut current_path = None;
+    for hunk in plan.hunks() {
+        let id = *hunk.id();
+        match hunk {
+            HunkPresentation::Text(text) => {
+                let (path, contents, presentation) = text.details();
+                let language = path
+                    .components()
+                    .next_back()
+                    .and_then(|name| SourceLanguage::from_file_name(name.as_internal_str()))
+                    .or(Some(SourceLanguage::Generic));
+                if current_path != Some(path) {
+                    let ui_path = path_converter.format_file_path(path);
+                    let description = match presentation {
+                        TextHunkPresentation::RegularFile => "Modified regular file",
+                        TextHunkPresentation::ExecutableFile => "Modified executable file",
+                        TextHunkPresentation::ModifiedConflict => "Modified conflict in",
+                        TextHunkPresentation::ResolvedConflict => "Resolved conflict in",
+                        TextHunkPresentation::CreatedConflict => "Created conflict in",
+                    };
+                    writeln!(formatter.labeled("header"), "{description} {ui_path}:")?;
+                    current_path = Some(path);
+                }
+                write_color_words_hunk_header(formatter, id, source)?;
+                // Context is unnumbered: only the hunk's own lines are numbered,
+                // and exactly those numbers are what line selections accept.
+                let line_labels = Diff::new("removed", "added");
+                let show_context = |formatter: &mut dyn Formatter,
+                                    context: &BStr,
+                                    closest_last: bool|
+                 -> io::Result<()> {
+                    let lines = context.split_inclusive(|b| *b == b'\n').collect_vec();
+                    let (shown, skipped) = if closest_last {
+                        let start = lines.len().saturating_sub(options.context);
+                        (&lines[start..], start > 0)
+                    } else {
+                        let end = lines.len().min(options.context);
+                        (&lines[..end], end < lines.len())
+                    };
+                    let mut formatter = formatter.labeled("context");
+                    if skipped && closest_last {
+                        writeln!(formatter, "    ...")?;
+                    }
+                    for line in shown {
+                        show_color_words_line_number(
+                            *formatter,
+                            Diff::new(None, None),
+                            line_labels,
+                        )?;
+                        show_color_words_inline_hunks(
+                            *formatter,
+                            &[(DiffLineHunkSide::Both, BStr::new(line))],
+                            line_labels,
+                        )?;
+                    }
+                    if skipped && !closest_last {
+                        writeln!(formatter, "    ...")?;
+                    }
+                    Ok(())
+                };
+                let context = text.context();
+                if let Some(leading) = context.before {
+                    show_context(formatter, leading, true)?;
+                }
+                match (contents.before.as_resolved(), contents.after.as_resolved()) {
+                    // The hunk is one changed block. Diffing its lines again by
+                    // line could align repeated lines differently from the diff
+                    // that defined the hunk, and so number the wrong lines.
+                    (Some(before), Some(after)) => {
+                        show_color_words_diff_lines(
+                            formatter,
+                            Diff::new(before, after).map(BStr::new),
+                            DiffLineNumber { left: 1, right: 1 },
+                            line_labels,
+                            options,
+                        )?;
+                    }
+                    (Some(_) | None, None) | (None, Some(_)) => show_color_words_diff_hunks(
+                        formatter,
+                        language,
+                        contents.as_ref(),
+                        labels,
+                        options,
+                        &materialize_options,
+                    )?,
+                }
+                if let Some(trailing) = context.after {
+                    show_context(formatter, trailing, false)?;
+                }
+            }
+            HunkPresentation::Path(path_view) => {
+                let removed_sources = path_view.removed_sources();
+                current_path = None;
+                write_color_words_hunk_header(formatter, id, source)?;
+                for removed_source in removed_sources {
+                    let source = path_converter.format_file_path(removed_source);
+                    writeln!(formatter.labeled("header"), "Removed source {source}:")?;
+                }
+                for (entry_path, entry_values) in path_view.entries() {
+                    let before = materialize_tree_value(
+                        store,
+                        entry_path.source(),
+                        entry_values.before.clone(),
+                        labels.before,
+                    )
+                    .await?;
+                    let after = materialize_tree_value(
+                        store,
+                        entry_path.target(),
+                        entry_values.after.clone(),
+                        labels.after,
+                    )
+                    .await?;
+                    show_color_words_materialized_entry(
+                        formatter,
+                        entry_path,
+                        Diff::new(before, after),
+                        path_converter,
+                        options,
+                        &materialize_options,
+                    )
+                    .await?;
+                }
+            }
+            HunkPresentation::Copy(copy_view) => {
+                let (paths, values, operation) = copy_view.details();
+                current_path = None;
+                write_color_words_hunk_header(formatter, id, source)?;
+                let tree_diff = futures::stream::once(future::ready(CopiesTreeDiffEntry {
+                    path: CopiesTreeDiffEntryPath {
+                        source: Some((paths.before.to_owned(), operation)),
+                        target: paths.after.to_owned(),
+                    },
+                    values: Ok(values.clone()),
+                }))
+                .boxed();
+                show_color_words_diff(
                     formatter,
-                    language,
-                    Diff::new(&left_content.contents.file_content, &empty_content()),
-                    Diff::new(
-                        &left_content.contents.conflict_labels,
-                        &ConflictLabels::unlabeled(),
-                    ),
+                    store,
+                    tree_diff,
+                    labels,
+                    path_converter,
                     options,
-                    materialize_options,
-                )?;
+                    &materialize_options,
+                )
+                .await?;
             }
         }
     }

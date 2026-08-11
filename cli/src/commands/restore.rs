@@ -14,18 +14,22 @@
 
 use std::io::Write as _;
 
-use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use indoc::formatdoc;
 use itertools::Itertools as _;
-use jj_lib::commit::conflict_label_for_commits;
-use jj_lib::merge::Diff;
+use jj_lib::diff_selection::DiffSelection;
+use jj_lib::diff_selection::DiffSelectionSource;
+use jj_lib::diff_selection::SelectionAction;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
+use crate::cli_util::DiffSelector;
+use crate::cli_util::HunkSelectionArgs;
+use crate::cli_util::RemainingHunkSummary;
 use crate::cli_util::RevisionArg;
+use crate::cli_util::SelectionDefault;
 use crate::cli_util::print_unmatched_explicit_paths;
 use crate::cli_util::rebase_or_reparent_descendants;
 use crate::command_error::CommandError;
@@ -47,8 +51,15 @@ use crate::ui::Ui;
 /// similar to `jj abandon`, except that it leaves an empty revision with its
 /// description and other metadata preserved.
 ///
-/// See `jj diffedit` if you'd like to restore portions of files rather than
-/// entire files.
+/// With `--hunk` or `--hunk-file`, only the selected changes are undone. The
+/// IDs are those `jj diff --hunks` lists for the same revisions: `jj diff
+/// --hunks -r <REV>` for `--changes-in <REV>`, and `jj diff --hunks --from
+/// <FROM> --to <INTO>` for `--from`/`--into`.
+/// Selecting a removed line restores it; selecting an added line removes it.
+/// Unselected changes remain in the destination.
+///
+/// Use `--interactive` to choose changes with a diff editor. See `jj diffedit`
+/// to edit the destination content directly.
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct RestoreArgs {
     /// Restore only these paths (instead of all paths)
@@ -88,14 +99,8 @@ pub(crate) struct RestoreArgs {
     #[arg(long, short, hide = true)]
     revision: Option<RevisionArg>,
 
-    /// Interactively choose which parts to restore
-    #[arg(long, short)]
-    interactive: bool,
-
-    /// Specify diff editor to be used (implies --interactive)
-    #[arg(long, value_name = "NAME")]
-    #[arg(add = ArgValueCandidates::new(complete::diff_editors))]
-    tool: Option<String>,
+    #[command(flatten)]
+    hunk_selection: HunkSelectionArgs,
 
     /// Preserve the content (not the diff) when rebasing descendants
     #[arg(long)]
@@ -108,6 +113,9 @@ pub(crate) async fn cmd_restore(
     command: &CommandHelper,
     args: &RestoreArgs,
 ) -> Result<(), CommandError> {
+    let selection_mode = args
+        .hunk_selection
+        .resolve(command.cwd(), SelectionDefault::Everything)?;
     let mut workspace_command = command.workspace_helper(ui).await?;
     let (from_commits, from_tree, to_commit);
     if args.revision.is_some() {
@@ -141,8 +149,7 @@ pub(crate) async fn cmd_restore(
 
     let fileset_expression = workspace_command.parse_file_patterns(ui, &args.paths)?;
     let matcher = fileset_expression.to_matcher();
-    let diff_selector =
-        workspace_command.diff_selector(ui, args.tool.as_deref(), args.interactive)?;
+    let diff_selector = workspace_command.diff_selector(ui, selection_mode)?;
     let to_tree = to_commit.tree();
     let format_instructions = || {
         formatdoc! {"
@@ -160,18 +167,38 @@ pub(crate) async fn cmd_restore(
             to_commit = workspace_command.format_commit_summary(&to_commit),
         }
     };
-    let new_tree = diff_selector
-        .select(
-            ui,
-            Diff::new(&to_tree, &from_tree),
-            Diff::new(
-                to_commit.conflict_label(),
-                conflict_label_for_commits(&from_commits),
-            ),
-            &matcher,
-            format_instructions,
-        )
-        .await?;
+    let new_tree = match &diff_selector {
+        // Hunk IDs name the changes `jj diff` lists from the restore source to
+        // the destination, so they are resolved against that forward transition,
+        // with the same unfiltered copy records, and undone there.
+        DiffSelector::Hunks(selections) => {
+            let source = DiffSelectionSource::Range {
+                from: &from_commits,
+                to: std::slice::from_ref(&to_commit),
+            };
+            let plan = DiffSelection::build(
+                source.capture(workspace_command.repo().as_ref()).await?,
+                &matcher,
+            )
+            .await?;
+            plan.select(selections, SelectionAction::Undo).await?
+        }
+        DiffSelector::NonInteractive | DiffSelector::Interactive(_) => {
+            diff_selector
+                .select(
+                    ui,
+                    DiffSelectionSource::Range {
+                        from: std::slice::from_ref(&to_commit),
+                        to: &from_commits,
+                    }
+                    .capture(workspace_command.repo().as_ref())
+                    .await?,
+                    &matcher,
+                    format_instructions,
+                )
+                .await?
+        }
+    };
 
     print_unmatched_explicit_paths(
         ui,
@@ -185,16 +212,24 @@ pub(crate) async fn cmd_restore(
         writeln!(ui.status(), "Nothing changed.")?;
     } else {
         let mut tx = workspace_command.start_transaction();
-        tx.repo_mut()
+        let rewritten_commit = tx
+            .repo_mut()
             .rewrite_commit(&to_commit)
             .set_tree(new_tree)
             .write()
             .await?;
+        let mut remaining_hunk_summary = RemainingHunkSummary::default();
+        if let DiffSelector::Hunks(_) = &diff_selector {
+            remaining_hunk_summary
+                .add_commit_tree(tx.repo(), &rewritten_commit, rewritten_commit.tree())
+                .await?;
+        }
         // rebase_descendants early; otherwise the new commit would always have
         // a conflicted change id at this point.
         rebase_or_reparent_descendants(ui, tx.repo_mut(), args.restore_descendants).await?;
         tx.finish(ui, format!("restore into commit {}", to_commit.id().hex()))
             .await?;
+        workspace_command.print_remaining_hunk_summary(ui, &remaining_hunk_summary)?;
     }
     Ok(())
 }

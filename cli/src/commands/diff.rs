@@ -19,20 +19,30 @@ use futures::future::try_join_all;
 use indexmap::IndexSet;
 use itertools::Itertools as _;
 use jj_lib::copies::CopyRecords;
+use jj_lib::diff_selection::DiffSelection;
+use jj_lib::diff_selection::DiffSelectionSource;
+use jj_lib::diff_selection::SelectionAction;
+use jj_lib::matchers::EverythingMatcher;
+use jj_lib::matchers::Matcher;
 use jj_lib::merge::Diff;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
+use crate::cli_util::HunkIdArgs;
 use crate::cli_util::RevisionArg;
 use crate::cli_util::print_unmatched_explicit_paths;
 use crate::cli_util::short_commit_hash;
 use crate::command_error::CommandError;
 use crate::command_error::user_error;
 use crate::complete;
+use crate::diff_util::ColorWordsDiffOptions;
 use crate::diff_util::DiffFormatArgs;
+use crate::diff_util::HunkSourceDisplay;
+use crate::diff_util::show_color_words_diff_for_selection;
 use crate::diff_util::show_templated;
+use crate::formatter::FormatterExt as _;
 use crate::ui::Ui;
 
 /// Compare file contents between two revisions
@@ -48,6 +58,12 @@ use crate::ui::Ui;
 /// (perhaps a bookmark name) to the working-copy commit.
 ///
 /// If no option is specified, it defaults to `-r @`.
+///
+/// With `--hunk` or `--hunk-file`, only the selected hunks of the diff are
+/// shown, using the IDs listed by `--hunks` for the same revision or range.
+/// Combine this with `--git` to get a patch of just those changes.
+/// For a partial text hunk, unselected removed lines are kept, followed by
+/// the selected added lines.
 #[derive(clap::Args, Clone, Debug)]
 #[command(mut_arg("ignore_all_space", |a| a.short('w')))]
 #[command(mut_arg("ignore_space_change", |a| a.short('b')))]
@@ -88,6 +104,26 @@ pub(crate) struct DiffArgs {
     #[arg(add = ArgValueCompleter::new(complete::modified_revision_or_range_files))]
     paths: Vec<String>,
 
+    /// Show hunks with IDs for use with `--hunk`
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "template",
+            "short-format",
+            "long-format",
+            "tool",
+            "ignore_all_space",
+            "ignore_space_change",
+            "hunk_ids",
+            "hunk_files",
+        ],
+        help_heading = "Diff Formatting Options",
+    )]
+    hunks: bool,
+
+    #[command(flatten)]
+    hunk_selection: HunkIdArgs,
+
     /// Render each file diff entry using the given template
     ///
     /// All 0-argument methods of the [`TreeDiffEntry` type][TreeDiffEntry] are
@@ -117,13 +153,20 @@ pub(crate) async fn cmd_diff(
     command: &CommandHelper,
     args: &DiffArgs,
 ) -> Result<(), CommandError> {
+    let selections = args.hunk_selection.resolve(command.cwd())?;
+    let uses_hunk_ids = args.hunks || !selections.is_empty();
     let workspace_command = command.workspace_helper(ui).await?;
     let repo = workspace_command.repo();
     let fileset_expression = workspace_command.parse_file_patterns(ui, &args.paths)?;
     let matcher = fileset_expression.to_matcher();
+    let copy_record_matcher = match uses_hunk_ids {
+        true => &EverythingMatcher as &dyn Matcher,
+        false => matcher.as_ref(),
+    };
 
     let from_tree;
     let to_tree;
+    let mut hunk_sources = None;
     let from_commits;
     let to_commits;
     if args.from.is_some() || args.to.is_some() {
@@ -146,6 +189,15 @@ pub(crate) async fn cmd_diff(
             .unwrap_or(std::slice::from_ref(&RevisionArg::AT));
         let revisions_evaluator = workspace_command.parse_union_revsets(ui, revision_args)?;
         let target_expression = revisions_evaluator.expression();
+        if uses_hunk_ids {
+            hunk_sources = Some(
+                workspace_command
+                    .attach_revset_evaluator(target_expression.clone())
+                    .evaluate_to_commits()?
+                    .try_collect::<Vec<_>>()
+                    .await?,
+            );
+        }
         let mut gaps_revset = workspace_command
             .attach_revset_evaluator(
                 target_expression
@@ -186,6 +238,61 @@ pub(crate) async fn cmd_diff(
         from_commits = parents;
         to_commits = heads;
     }
+
+    let mut shown_tree = to_tree.clone();
+    if uses_hunk_ids {
+        let sources = match hunk_sources.as_deref() {
+            Some([source, rest @ ..]) => std::iter::once(source)
+                .chain(rest)
+                .map(DiffSelectionSource::Commit)
+                .collect::<Vec<_>>(),
+            None | Some([]) => vec![DiffSelectionSource::Range {
+                from: &from_commits,
+                to: &to_commits,
+            }],
+        };
+        let source_display = match sources.as_slice() {
+            [_, _, ..] if !args.hunks => {
+                return Err(user_error(
+                    "`--hunk` and `--hunk-file` require a single revision or `--from`/`--to`",
+                ));
+            }
+            [_, _, ..] => HunkSourceDisplay::Show,
+            [] | [_] => HunkSourceDisplay::Hide,
+        };
+        let mut options = ColorWordsDiffOptions::from_settings(workspace_command.settings())?;
+        options.merge_args(&args.format);
+        for source in sources {
+            let plan = DiffSelection::build(source.capture(repo.as_ref()).await?, &matcher).await?;
+            if args.hunks {
+                ui.request_pager();
+                let mut formatter = ui.stdout_formatter();
+                let mut formatter = formatter.labeled("diff");
+                show_color_words_diff_for_selection(
+                    *formatter.labeled("color_words"),
+                    repo.store(),
+                    &plan,
+                    workspace_command.env().path_converter(),
+                    &options,
+                    workspace_command.env().conflict_marker_style(),
+                    source_display,
+                )
+                .await?;
+            } else {
+                shown_tree = plan.select(&selections, SelectionAction::Select).await?;
+            }
+        }
+        if args.hunks {
+            print_unmatched_explicit_paths(
+                ui,
+                &workspace_command,
+                &fileset_expression,
+                [&from_tree, &to_tree],
+            )
+            .await?;
+            return Ok(());
+        }
+    }
     let roots = from_commits
         .iter()
         .map(|commit| commit.id().clone())
@@ -194,7 +301,8 @@ pub(crate) async fn cmd_diff(
         .iter()
         .map(|commit| commit.id().clone())
         .collect::<Vec<_>>();
-    let copy_records = CopyRecords::collect(repo.store(), &roots, &heads, &matcher).await?;
+    let copy_records =
+        CopyRecords::collect(repo.store(), &roots, &heads, copy_record_matcher).await?;
 
     // -T disables both short/long rendering formats, but it might be okay to
     // enable long format if explicitly specified (assuming -T is for short or
@@ -216,7 +324,7 @@ pub(crate) async fn cmd_diff(
     ui.request_pager();
     if let Some(template) = &maybe_template {
         let transition = copy_records
-            .bind(Diff::new(from_tree.clone(), to_tree.clone()))
+            .bind(Diff::new(from_tree.clone(), shown_tree.clone()))
             .await?;
         let tree_diff = transition.diff(&matcher);
         show_templated(ui.stdout_formatter().as_mut(), tree_diff, template).await?;
@@ -225,7 +333,7 @@ pub(crate) async fn cmd_diff(
         .show_diff(
             ui,
             ui.stdout_formatter().as_mut(),
-            Diff::new(&from_tree, &to_tree),
+            Diff::new(&from_tree, &shown_tree),
             &matcher,
             &copy_records,
             ui.term_width(),

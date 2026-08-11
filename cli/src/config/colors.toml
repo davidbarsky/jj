@@ -84,6 +84,9 @@
 "diff binary" = "cyan"
 "diff file_header" = { bold = true }
 "diff hunk_header" = "cyan"
+"diff hunk_header keyword" = { dim = true }
+"diff hunk_header id" = { bold = true }
+"diff hunk_header source" = { dim = true }
 "diff context line_number" = { dim = true }
 "diff removed" = { fg = "red" }
 "diff added" = { fg = "green" }

@@ -15,15 +15,21 @@
 use std::collections::HashMap;
 use std::iter::once;
 
-use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use futures::TryStreamExt as _;
 use futures::future::try_join_all;
 use indoc::formatdoc;
+use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
 use jj_lib::commit::CommitIteratorExt as _;
+use jj_lib::diff_selection::DiffHunkContext;
+use jj_lib::diff_selection::DiffHunkId;
+use jj_lib::diff_selection::DiffSelection;
+use jj_lib::diff_selection::DiffSelectionError;
+use jj_lib::diff_selection::DiffSelectionSource;
+use jj_lib::diff_selection::HunkSelection;
+use jj_lib::diff_selection::SelectionAction;
 use jj_lib::matchers::Matcher;
-use jj_lib::merge::Diff;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite;
@@ -33,7 +39,10 @@ use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::DiffSelector;
+use crate::cli_util::HunkSelectionArgs;
+use crate::cli_util::RemainingHunkSummary;
 use crate::cli_util::RevisionArg;
+use crate::cli_util::SelectionDefault;
 use crate::cli_util::WorkspaceCommandTransaction;
 use crate::cli_util::compute_commit_location;
 use crate::cli_util::print_unmatched_explicit_paths;
@@ -66,7 +75,11 @@ use crate::ui::Ui;
 ///
 /// If, after moving changes out, the source revision is empty compared to its
 /// parent(s), and `--keep-emptied` is not set, it will be abandoned. Without
-/// `--interactive` or paths, the source revision will always be empty.
+/// selection options or paths, the source revision will always be empty.
+///
+/// With `--hunk` or `--hunk-file`, only the selected changes move to the
+/// destination. The remaining changes stay in the source revisions. Use the
+/// IDs listed by `jj diff --hunks -r <SOURCE>`.
 ///
 /// If the source was abandoned and both the source and destination had a
 /// non-empty description, you will be asked for the combined description. If
@@ -161,14 +174,8 @@ pub(crate) struct SquashArgs {
     #[arg(long)]
     editor: bool,
 
-    /// Interactively choose which parts to squash
-    #[arg(long, short)]
-    interactive: bool,
-
-    /// Specify diff editor to be used (implies --interactive)
-    #[arg(long, value_name = "NAME")]
-    #[arg(add = ArgValueCandidates::new(complete::diff_editors))]
-    tool: Option<String>,
+    #[command(flatten)]
+    hunk_selection: HunkSelectionArgs,
 
     /// Move only changes to these paths (instead of all paths)
     #[arg(value_name = "FILESETS", value_hint = clap::ValueHint::AnyPath)]
@@ -180,6 +187,11 @@ pub(crate) struct SquashArgs {
     keep_emptied: bool,
 }
 
+struct SquashSource {
+    commit: Commit,
+    hunk_context: CommitId,
+}
+
 #[instrument(skip_all)]
 pub(crate) async fn cmd_squash(
     ui: &mut Ui,
@@ -189,6 +201,9 @@ pub(crate) async fn cmd_squash(
     let insert_destination_commit =
         args.onto.is_some() || args.insert_after.is_some() || args.insert_before.is_some();
 
+    let selection_mode = args
+        .hunk_selection
+        .resolve(command.cwd(), SelectionDefault::Everything)?;
     let mut workspace_command = command.workspace_helper(ui).await?;
 
     let mut sources: Vec<Commit>;
@@ -252,8 +267,17 @@ pub(crate) async fn cmd_squash(
         .check_rewritable(sources.iter().chain(&pre_existing_destination).ids())
         .await?;
 
-    // prepare the tx description before possibly rebasing the source commits
-    let source_ids: Vec<_> = sources.iter().ids().collect();
+    let mut sources = sources
+        .into_iter()
+        .map(|commit| SquashSource {
+            hunk_context: commit.id().clone(),
+            commit,
+        })
+        .collect::<Vec<_>>();
+    let source_ids = sources
+        .iter()
+        .map(|source| &source.hunk_context)
+        .collect::<Vec<_>>();
     let tx_description = if let Some(destination) = &pre_existing_destination {
         format!("squash commits into {}", destination.id().hex())
     } else {
@@ -318,8 +342,8 @@ pub(crate) async fn cmd_squash(
             })
             .await?;
         for source in &mut *sources {
-            if let Some(rewritten_source) = rewritten.remove(source.id()) {
-                *source = rewritten_source;
+            if let Some(rewritten_source) = rewritten.remove(source.commit.id()) {
+                source.commit = rewritten_source;
             }
         }
         commit
@@ -329,9 +353,9 @@ pub(crate) async fn cmd_squash(
         .base_workspace_helper()
         .parse_file_patterns(ui, &args.paths)?;
     let matcher = fileset_expression.to_matcher();
-    let diff_selector =
-        tx.base_workspace_helper()
-            .diff_selector(ui, args.tool.as_deref(), args.interactive)?;
+    let diff_selector = tx
+        .base_workspace_helper()
+        .diff_selector(ui, selection_mode)?;
     let text_editor = tx.base_workspace_helper().text_editor()?;
     let squashed_description = SquashedDescription::from_args(args);
 
@@ -345,6 +369,19 @@ pub(crate) async fn cmd_squash(
         source_commits.iter().map(|commit| &commit.selected_tree),
     )
     .await?;
+
+    let mut remaining_hunk_summary = RemainingHunkSummary::default();
+    if let DiffSelector::Hunks(_) = &diff_selector {
+        for source in &source_commits {
+            if !args.keep_emptied && source.is_full_selection() {
+                continue;
+            }
+            let remaining_tree = source.remaining_tree().await?;
+            remaining_hunk_summary
+                .add_commit_tree(tx.repo(), &source.commit, remaining_tree)
+                .await?;
+        }
+    }
 
     if let Some(squashed) = rewrite::squash_commits(
         tx.repo_mut(),
@@ -454,6 +491,7 @@ pub(crate) async fn cmd_squash(
         }
     }
     tx.finish(ui, tx_description).await?;
+    workspace_command.print_remaining_hunk_summary(ui, &remaining_hunk_summary)?;
     Ok(())
 }
 
@@ -485,15 +523,67 @@ impl SquashedDescription {
 async fn select_diff(
     ui: &Ui,
     tx: &WorkspaceCommandTransaction<'_>,
-    sources: &[Commit],
+    sources: &[SquashSource],
     destination: &Commit,
     matcher: &dyn Matcher,
     diff_selector: &DiffSelector,
 ) -> Result<Vec<CommitWithSelection>, CommandError> {
-    let mut source_commits = vec![];
+    let mut parent_trees = Vec::with_capacity(sources.len());
     for source in sources {
-        let parent_tree = source.parent_tree(tx.repo().index()).await?;
-        let source_tree = source.tree();
+        parent_trees.push(source.commit.parent_tree(tx.repo().index()).await?);
+    }
+
+    // Every requested ID has to be routed to the source that contains it before
+    // any source is selected. Finding it means enumerating each source's atoms,
+    // and the plan that enumeration produced is the plan that applies them. IDs
+    // hash only an atom's own path and content, so identical changes in two
+    // sources share an ID, and such an ID is rejected rather than guessed.
+    let mut hunk_plans: Vec<Option<(DiffSelection, Vec<HunkSelection>)>> =
+        Vec::with_capacity(sources.len());
+    match diff_selector {
+        DiffSelector::Hunks(requested) => {
+            let mut owners: HashMap<DiffHunkId, Vec<usize>> = HashMap::new();
+            let mut plans = Vec::with_capacity(sources.len());
+            for (source_index, source) in sources.iter().enumerate() {
+                let source = DiffSelectionSource::Rewritten {
+                    commit: &source.commit,
+                    tree: source.commit.tree(),
+                    context: DiffHunkContext::Commit(source.hunk_context.clone()),
+                };
+                let plan = DiffSelection::build(source.capture(tx.repo()).await?, matcher).await?;
+                for hunk in plan.hunks() {
+                    owners.entry(*hunk.id()).or_default().push(source_index);
+                }
+                plans.push(plan);
+            }
+            let mut ids_by_source = vec![Vec::new(); sources.len()];
+            for selection in requested {
+                let source_index = match owners.get(&selection.id).map(Vec::as_slice) {
+                    None | Some([]) => {
+                        return Err(user_error(DiffSelectionError::HunkNotFound(selection.id)));
+                    }
+                    Some([source_index]) => *source_index,
+                    Some([_, _, ..]) => {
+                        return Err(user_error(format!(
+                            "Hunk `{}` matches identical changes in more than one source revision",
+                            selection.id
+                        ))
+                        .hinted("Use `--from` to name the revision to move it from"));
+                    }
+                };
+                ids_by_source[source_index].push(selection.clone());
+            }
+            hunk_plans.extend(plans.into_iter().zip(ids_by_source).map(Some));
+        }
+        DiffSelector::NonInteractive | DiffSelector::Interactive(_) => {
+            hunk_plans.resize_with(sources.len(), || None);
+        }
+    }
+
+    let mut source_commits = vec![];
+    let sources_with_plans = sources.iter().zip(parent_trees).zip(hunk_plans);
+    for ((source, parent_tree), hunk_plan) in sources_with_plans {
+        let source_tree = source.commit.tree();
         let format_instructions = || {
             formatdoc! {"
                 You are moving changes from: {source}
@@ -507,24 +597,31 @@ async fn select_diff(
                 to the destination. If you don't make any changes, then all the changes
                 from the source will be moved into the destination.
                 ",
-                source = tx.format_commit_summary(source),
+                source = tx.format_commit_summary(&source.commit),
                 destination = tx.format_commit_summary(destination),
             }
         };
-        let selected_tree = diff_selector
-            .select(
-                ui,
-                Diff::new(&parent_tree, &source_tree),
-                Diff::new(
-                    source.parents_conflict_label().await?,
-                    source.conflict_label(),
-                ),
-                matcher,
-                format_instructions,
-            )
-            .await?;
+        let selected_tree = match &hunk_plan {
+            Some((plan, ids)) => plan.select(ids, SelectionAction::Select).await?,
+            None => {
+                diff_selector
+                    .select(
+                        ui,
+                        DiffSelectionSource::Rewritten {
+                            commit: &source.commit,
+                            tree: source_tree,
+                            context: DiffHunkContext::Commit(source.hunk_context.clone()),
+                        }
+                        .capture(tx.repo())
+                        .await?,
+                        matcher,
+                        format_instructions,
+                    )
+                    .await?
+            }
+        };
         source_commits.push(CommitWithSelection {
-            commit: source.clone(),
+            commit: source.commit.clone(),
             selected_tree,
             parent_tree,
         });

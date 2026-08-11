@@ -29,6 +29,7 @@ use jj_lib::config::ConfigGetError;
 use jj_lib::config::ConfigLoadError;
 use jj_lib::config::ConfigMigrateError;
 use jj_lib::converge::ConvergeError;
+use jj_lib::diff_selection::DiffSelectionError;
 use jj_lib::dsl_util::Diagnostics;
 use jj_lib::evolution::WalkPredecessorsError;
 use jj_lib::fileset::FilePatternParseError;
@@ -327,6 +328,21 @@ impl From<BackendError> for CommandError {
 impl From<IndexError> for CommandError {
     fn from(err: IndexError) -> Self {
         internal_error_with_message("Unexpected error from index", err)
+    }
+}
+
+impl From<DiffSelectionError> for CommandError {
+    fn from(err: DiffSelectionError) -> Self {
+        match err {
+            DiffSelectionError::Backend(err) => err.into(),
+            DiffSelectionError::HunkNotFound(_)
+            | DiffSelectionError::LinesUnsupported(_)
+            | DiffSelectionError::LineNotInHunk {
+                id: _,
+                side: _,
+                line: _,
+            } => user_error(err),
+        }
     }
 }
 

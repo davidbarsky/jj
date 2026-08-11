@@ -22,6 +22,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Debug;
 use std::io;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::mem;
 use std::path::Path;
@@ -40,6 +41,7 @@ use clap::builder::TypedValueParser as _;
 use clap::builder::ValueParserFactory;
 use clap::error::ContextKind;
 use clap::error::ContextValue;
+use clap_complete::ArgValueCandidates;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::future::try_join_all;
@@ -69,6 +71,12 @@ use jj_lib::conflicts::ConflictMarkerStyle;
 use jj_lib::default_backend_factories::default_backend_factories;
 use jj_lib::default_backend_factories::default_working_copy_factories;
 use jj_lib::default_backend_factories::default_workspace_loader_factory;
+use jj_lib::diff_selection::CapturedDiff;
+use jj_lib::diff_selection::DiffHunkContext;
+use jj_lib::diff_selection::DiffSelection;
+use jj_lib::diff_selection::DiffSelectionSource;
+use jj_lib::diff_selection::HunkSelection;
+use jj_lib::diff_selection::SelectionAction;
 use jj_lib::fileset;
 use jj_lib::fileset::FilesetAliasesMap;
 use jj_lib::fileset::FilesetDiagnostics;
@@ -78,6 +86,7 @@ use jj_lib::gitignore::GitIgnoreError;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::id_prefix::IdPrefixContext;
 use jj_lib::lock::FileLock;
+use jj_lib::matchers::EverythingMatcher;
 use jj_lib::matchers::Matcher;
 use jj_lib::matchers::NothingMatcher;
 use jj_lib::merge::Diff;
@@ -172,6 +181,7 @@ use crate::command_error::user_error;
 use crate::command_error::user_error_with_message;
 use crate::commit_templater::CommitTemplateLanguage;
 use crate::commit_templater::CommitTemplateLanguageExtension;
+use crate::complete;
 use crate::config::ConfigEnv;
 use crate::config::RawConfig;
 use crate::config::config_from_environment;
@@ -1675,6 +1685,55 @@ to the current parents may contain changes from multiple commits.
         self.path_converter().format_file_path(file)
     }
 
+    pub(crate) fn print_remaining_hunk_summary(
+        &self,
+        ui: &Ui,
+        summary: &RemainingHunkSummary,
+    ) -> Result<(), CommandError> {
+        if summary.counts.is_empty() {
+            return Ok(());
+        }
+        let Some(mut formatter) = ui.status_formatter() else {
+            return Ok(());
+        };
+        writeln!(formatter, "Remaining changes:")?;
+        let mut output = formatter.labeled("diff");
+        let mut output = output.into_labeled("hunks");
+        for (path, count) in &summary.counts {
+            let path = self.format_file_path(path);
+            let noun = if *count == 1 { "hunk" } else { "hunks" };
+            writeln!(output.labeled("header"), "  {path}: {count} {noun}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RemainingHunkSummary {
+    counts: BTreeMap<RepoPathBuf, usize>,
+}
+
+impl RemainingHunkSummary {
+    pub(crate) async fn add_commit_tree(
+        &mut self,
+        repo: &dyn Repo,
+        commit: &Commit,
+        tree: MergedTree,
+    ) -> BackendResult<()> {
+        let source = DiffSelectionSource::Rewritten {
+            commit,
+            tree,
+            context: DiffHunkContext::Commit(commit.id().clone()),
+        };
+        let plan = DiffSelection::build(source.capture(repo).await?, &EverythingMatcher).await?;
+        for hunk in plan.hunks() {
+            *self.counts.entry(hunk.path().to_owned()).or_insert(0) += 1;
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceCommandHelper {
     /// Parses a path relative to cwd into a RepoPath, which is relative to the
     /// workspace root.
     pub fn parse_file_path(&self, input: &str) -> Result<RepoPathBuf, UiPathParseError> {
@@ -1790,18 +1849,17 @@ to the current parents may contain changes from multiple commits.
     }
 
     /// Conditionally loads diff editor from the settings.
-    ///
-    /// If the `tool_name` is specified, interactive session is implied.
     pub fn diff_selector(
         &self,
         ui: &Ui,
-        tool_name: Option<&str>,
-        force_interactive: bool,
+        mode: SelectionMode,
     ) -> Result<DiffSelector, CommandError> {
-        if tool_name.is_some() || force_interactive {
-            Ok(DiffSelector::Interactive(self.diff_editor(ui, tool_name)?))
-        } else {
-            Ok(DiffSelector::NonInteractive)
+        match mode {
+            SelectionMode::Everything => Ok(DiffSelector::NonInteractive),
+            SelectionMode::Interactive { tool } => Ok(DiffSelector::Interactive(
+                self.diff_editor(ui, tool.as_deref())?,
+            )),
+            SelectionMode::Hunks(ids) => Ok(DiffSelector::Hunks(ids)),
         }
     }
 
@@ -3608,57 +3666,207 @@ pub fn short_operation_hash(operation_id: &OperationId) -> String {
     format!("{operation_id:.12}")
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SelectionDefault {
+    Everything,
+    Interactive,
+}
+
+/// Selects changes by the hunk IDs that `jj diff --hunks` lists.
+///
+/// Commands that also offer a diff editor declare their `--interactive` and
+/// `--tool` conflicts against `hunk_ids` and `hunk_files`.
+#[derive(clap::Args, Clone, Debug)]
+pub(crate) struct HunkIdArgs {
+    /// Select only the changes identified by these hunk IDs
+    ///
+    /// To select only some lines of a text hunk, append `:` and the line
+    /// numbers shown by `jj diff --hunks`: `-N` for a removed line and `+N`
+    /// for an added line. Items can be inclusive ranges and are separated by
+    /// commas, as in `ID:-2-4,+3`.
+    #[arg(long = "hunk", value_name = "ID[:LINES]")]
+    hunk_ids: Vec<HunkSelection>,
+
+    /// Read hunk IDs from a file (can be repeated)
+    ///
+    /// The file must contain one hunk ID per line, in the same form as
+    /// `--hunk`. Empty lines and lines that start with `#` are ignored. Use `-`
+    /// to read from standard input. This option can be combined with `--hunk`.
+    #[arg(
+        long = "hunk-file",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath
+    )]
+    hunk_files: Vec<PathBuf>,
+}
+
+impl HunkIdArgs {
+    /// Collects the selections from `--hunk` and every `--hunk-file`.
+    ///
+    /// Returns an empty list when neither flag was given, but rejects hunk
+    /// files that contain no IDs so that an empty input is not mistaken for
+    /// "select everything".
+    pub(crate) fn resolve(&self, cwd: &Path) -> Result<Vec<HunkSelection>, CommandError> {
+        let Self {
+            hunk_ids,
+            hunk_files,
+        } = self;
+        if hunk_files
+            .iter()
+            .filter(|path| path.as_path() == Path::new("-"))
+            .count()
+            > 1
+        {
+            return Err(user_error("`--hunk-file -` may only be specified once"));
+        }
+        let mut ids = hunk_ids.clone();
+        for path in hunk_files {
+            let (source, contents) = if path == Path::new("-") {
+                let mut contents = String::new();
+                io::stdin().read_to_string(&mut contents).map_err(|err| {
+                    user_error_with_message("Failed to read hunk IDs from standard input", err)
+                })?;
+                ("standard input".to_owned(), contents)
+            } else {
+                let source = path.display().to_string();
+                let contents = std::fs::read_to_string(cwd.join(path)).map_err(|err| {
+                    user_error_with_message(format!("Failed to read hunk IDs from {source}"), err)
+                })?;
+                (source, contents)
+            };
+            let numbered_lines = contents.lines().enumerate();
+            for (line_number, line) in numbered_lines {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let id = line.parse().map_err(|err| {
+                    user_error_with_message(
+                        format!("Failed to parse hunk ID at {source}:{}", line_number + 1),
+                        err,
+                    )
+                })?;
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() && !hunk_files.is_empty() {
+            return Err(user_error("No hunk IDs found in `--hunk-file` input"));
+        }
+        Ok(ids)
+    }
+}
+
+#[derive(clap::Args, Clone, Debug)]
+pub(crate) struct HunkSelectionArgs {
+    /// Interactively choose which changes to select.
+    #[arg(short, long, conflicts_with_all = ["hunk_ids", "hunk_files"])]
+    interactive: bool,
+
+    /// Specify the diff editor to use (implies `--interactive`).
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["hunk_ids", "hunk_files"])]
+    #[arg(add = ArgValueCandidates::new(complete::diff_editors))]
+    tool: Option<String>,
+
+    #[command(flatten)]
+    hunks: HunkIdArgs,
+}
+
+impl HunkSelectionArgs {
+    pub(crate) fn resolve(
+        &self,
+        cwd: &Path,
+        default: SelectionDefault,
+    ) -> Result<SelectionMode, CommandError> {
+        let Self {
+            interactive,
+            tool,
+            hunks,
+        } = self;
+        let ids = hunks.resolve(cwd)?;
+        match (ids.as_slice(), tool, *interactive, default) {
+            ([_, ..], Some(_), _, _) | ([_, ..], None, true, _) => Err(user_error(
+                "Hunk selection cannot be combined with `--interactive` or `--tool`",
+            )),
+            ([_, ..], None, false, _) => Ok(SelectionMode::Hunks(ids)),
+            ([], Some(_), _, _)
+            | ([], None, true, _)
+            | ([], None, false, SelectionDefault::Interactive) => {
+                Ok(SelectionMode::Interactive { tool: tool.clone() })
+            }
+            ([], None, false, SelectionDefault::Everything) => Ok(SelectionMode::Everything),
+        }
+    }
+}
+
+/// Which of the three mutually exclusive ways to choose a subset of a diff.
+#[derive(Clone, Debug)]
+pub enum SelectionMode {
+    /// Take every change the matcher admits.
+    Everything,
+    /// Open a diff editor.
+    Interactive {
+        /// An explicitly requested editor.
+        tool: Option<String>,
+    },
+    /// Take exactly the listed semantic atoms, or lines of them.
+    Hunks(Vec<HunkSelection>),
+}
+
 /// Wrapper around a `DiffEditor` to conditionally start interactive session.
 #[derive(Clone, Debug)]
 pub enum DiffSelector {
     NonInteractive,
     Interactive(DiffEditor),
+    Hunks(Vec<HunkSelection>),
 }
 
 impl DiffSelector {
     pub fn is_interactive(&self) -> bool {
-        matches!(self, Self::Interactive(_))
+        match self {
+            Self::Interactive(_) => true,
+            Self::NonInteractive | Self::Hunks(_) => false,
+        }
     }
 
-    /// Restores diffs from the `right_tree` to the `left_tree` by using an
-    /// interactive editor if enabled.
-    ///
-    /// Only files matching the `matcher` will be copied to the new tree.
+    /// Selects within a captured transition, sharing its semantic atom scope.
     pub async fn select(
         &self,
         ui: &Ui,
-        trees: Diff<&MergedTree>,
-        tree_labels: Diff<String>,
+        captured: CapturedDiff,
         matcher: &dyn Matcher,
         format_instructions: impl FnOnce() -> String,
     ) -> Result<MergedTree, CommandError> {
+        let editor = match self {
+            Self::Hunks(ids) => {
+                let plan = DiffSelection::build(captured, matcher).await?;
+                return Ok(plan.select(ids, SelectionAction::Select).await?);
+            }
+            Self::NonInteractive => None,
+            Self::Interactive(editor) => Some(editor),
+        };
+        let trees = captured.trees();
+        let tree_labels = captured.tree_labels();
         let selected_tree = restore_tree(
-            trees.after,
-            trees.before,
-            tree_labels.after,
-            tree_labels.before,
+            &trees.after,
+            &trees.before,
+            tree_labels.after.to_owned(),
+            tree_labels.before.to_owned(),
             matcher,
         )
         .await?;
-        match self {
-            Self::NonInteractive => Ok(selected_tree),
-            Self::Interactive(editor) => {
-                if selected_tree.tree_ids() == trees.before.tree_ids() {
-                    writeln!(ui.warning_default(), "Empty diff - won't run diff editor.")?;
-                    Ok(selected_tree)
-                } else {
-                    // edit_diff_external() is designed to edit the right tree,
-                    // whereas we want to update the left tree. Unmatched paths
-                    // shouldn't be based off the right tree.
-                    Ok(editor
-                        .edit(
-                            Diff::new(trees.before, &selected_tree),
-                            matcher,
-                            format_instructions,
-                        )
-                        .await?)
-                }
+        match editor {
+            None => Ok(selected_tree),
+            Some(_) if selected_tree.tree_ids() == trees.before.tree_ids() => {
+                writeln!(ui.warning_default(), "Empty diff - won't run diff editor.")?;
+                Ok(selected_tree)
             }
+            Some(editor) => Ok(editor
+                .edit(
+                    Diff::new(&trees.before, &selected_tree),
+                    matcher,
+                    format_instructions,
+                )
+                .await?),
         }
     }
 }
