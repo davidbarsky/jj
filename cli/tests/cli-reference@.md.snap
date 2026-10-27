@@ -1105,6 +1105,8 @@ With the `--from` and/or `--to` options, starts a [diff editor] comparing the "f
 
 Edit the right side of the diff until it looks the way you want. Once you close the editor, the revision specified with `-r` or `--to` will be updated. Unless `--restore-descendants` is used, descendants will be rebased on top as usual, which may result in conflicts.
 
+With `--hunk` or `--hunk-file`, no diff editor is started. Instead, the revision keeps only the selected hunks of the diff, as listed by `jj diff --hunks` with the same `-r` or `--from`/`--to` arguments; the other hunks are removed. Hunks outside the given paths are kept.
+
 See `jj restore` if you want to move entire files from one revision to another. For moving changes between revisions, see `jj squash -i`.
 
 **Usage:** `jj diffedit [OPTIONS] [FILESETS]...`
@@ -1125,6 +1127,12 @@ See `jj restore` if you want to move entire files from one revision to another. 
 
    Defaults to @ if --from is specified.
 * `--tool <NAME>` — Specify diff editor to be used
+* `--hunk <ID[:LINES]>` — Select only the changes identified by these hunk IDs
+
+   To select only some lines of a text hunk, append `:` and the line numbers shown by `jj diff --hunks`: `-N` for a removed line and `+N` for an added line. Items can be inclusive ranges and are separated by commas, as in `ID:-2-4,+3`.
+* `--hunk-file <PATH>` — Read hunk IDs from a file (can be repeated)
+
+   The file must contain one hunk ID per line, in the same form as `--hunk`. Empty lines and lines that start with `#` are ignored. Use `-` to read from standard input. This option can be combined with `--hunk`.
 * `--restore-descendants` — Preserve the content (not the diff) when rebasing descendants
 
    When rebasing a descendant on top of the rewritten revision, its diff compared to its parent(s) is normally preserved, i.e. the same way that descendants are always rebased. This flag makes it so the content/state is preserved instead of preserving the diff.

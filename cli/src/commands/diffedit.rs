@@ -16,12 +16,17 @@ use std::io::Write as _;
 
 use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
+use jj_lib::diff_selection::DiffHunkContext;
+use jj_lib::diff_selection::DiffSelection;
+use jj_lib::diff_selection::DiffSelectionSource;
+use jj_lib::diff_selection::SelectionAction;
 use jj_lib::merge::Diff;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::rewrite::merge_commit_trees;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
+use crate::cli_util::HunkIdArgs;
 use crate::cli_util::RevisionArg;
 use crate::cli_util::print_unmatched_explicit_paths;
 use crate::cli_util::rebase_or_reparent_descendants;
@@ -43,6 +48,11 @@ use crate::ui::Ui;
 /// close the editor, the revision specified with `-r` or `--to` will be
 /// updated. Unless `--restore-descendants` is used, descendants will be
 /// rebased on top as usual, which may result in conflicts.
+///
+/// With `--hunk` or `--hunk-file`, no diff editor is started. Instead, the
+/// revision keeps only the selected hunks of the diff, as listed by `jj diff
+/// --hunks` with the same `-r` or `--from`/`--to` arguments; the other hunks
+/// are removed. Hunks outside the given paths are kept.
 ///
 /// See `jj restore` if you want to move entire files from one revision to
 /// another. For moving changes between revisions, see `jj squash -i`.
@@ -75,9 +85,12 @@ pub(crate) struct DiffeditArgs {
     paths: Vec<String>,
 
     /// Specify diff editor to be used
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["hunk_ids", "hunk_files"])]
     #[arg(add = ArgValueCandidates::new(complete::diff_editors))]
     tool: Option<String>,
+
+    #[command(flatten)]
+    hunks: HunkIdArgs,
 
     /// Preserve the content (not the diff) when rebasing descendants
     ///
@@ -95,11 +108,12 @@ pub(crate) async fn cmd_diffedit(
     command: &CommandHelper,
     args: &DiffeditArgs,
 ) -> Result<(), CommandError> {
+    let selections = args.hunks.resolve(command.cwd())?;
     let mut workspace_command = command.workspace_helper(ui).await?;
     let fileset_expression = workspace_command.parse_file_patterns(ui, &args.paths)?;
     let matcher = fileset_expression.to_matcher();
 
-    let (target_commit, base_commits, diff_description);
+    let (target_commit, base_commits, diff_description, hunk_context);
     if args.from.is_some() || args.to.is_some() {
         target_commit = workspace_command
             .resolve_single_rev(ui, args.to.as_ref().unwrap_or(&RevisionArg::AT))
@@ -113,36 +127,51 @@ pub(crate) async fn cmd_diffedit(
             "The diff initially shows the commit's changes relative to:\n{}",
             workspace_command.format_commit_summary(&base_commits[0])
         );
+        hunk_context = DiffHunkContext::TreePair;
     } else {
         target_commit = workspace_command
             .resolve_single_rev(ui, args.revision.as_ref().unwrap_or(&RevisionArg::AT))
             .await?;
         base_commits = target_commit.parents().await?;
         diff_description = "The diff initially shows the commit's changes.".to_string();
+        hunk_context = DiffHunkContext::Commit(target_commit.id().clone());
     }
     workspace_command
         .check_rewritable([target_commit.id()])
         .await?;
 
-    let diff_editor = workspace_command.diff_editor(ui, args.tool.as_deref())?;
-    let mut tx = workspace_command.start_transaction();
-    let format_instructions = || {
-        format!(
-            "\
+    let repo = workspace_command.repo().as_ref();
+    let base_tree = merge_commit_trees(repo, base_commits.as_slice()).await?;
+    let tree = target_commit.tree();
+    let edited_tree = if selections.is_empty() {
+        let diff_editor = workspace_command.diff_editor(ui, args.tool.as_deref())?;
+        let format_instructions = || {
+            format!(
+                "\
 You are editing changes in: {}
 
 {diff_description}
 
 Adjust the right side until it shows the contents you want. If you
 don't make any changes, then the operation will be aborted.",
-            tx.format_commit_summary(&target_commit),
-        )
+                workspace_command.format_commit_summary(&target_commit),
+            )
+        };
+        diff_editor
+            .edit(Diff::new(&base_tree, &tree), &matcher, format_instructions)
+            .await?
+    } else {
+        let source = match hunk_context {
+            DiffHunkContext::Commit(_) => DiffSelectionSource::Commit(&target_commit),
+            DiffHunkContext::TreePair => DiffSelectionSource::Range {
+                from: &base_commits,
+                to: std::slice::from_ref(&target_commit),
+            },
+        };
+        let plan = DiffSelection::build(source.capture(repo).await?, &matcher).await?;
+        plan.select(&selections, SelectionAction::Keep).await?
     };
-    let base_tree = merge_commit_trees(tx.repo(), base_commits.as_slice()).await?;
-    let tree = target_commit.tree();
-    let edited_tree = diff_editor
-        .edit(Diff::new(&base_tree, &tree), &matcher, format_instructions)
-        .await?;
+    let mut tx = workspace_command.start_transaction();
     if edited_tree.tree_ids() == target_commit.tree_ids() {
         writeln!(ui.status(), "Nothing changed.")?;
     } else {

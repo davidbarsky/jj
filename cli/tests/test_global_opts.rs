@@ -1374,6 +1374,8 @@ fn test_help() {
       -f, --from <REVSET>        Show changes from this revision
       -t, --to <REVSET>          Edit changes in this revision
           --tool <NAME>          Specify diff editor to be used
+          --hunk <ID[:LINES]>    Select only the changes identified by these hunk IDs
+          --hunk-file <PATH>     Read hunk IDs from a file (can be repeated)
           --restore-descendants  Preserve the content (not the diff) when rebasing descendants
       -h, --help                 Print help (see more with '--help')
 

@@ -1092,6 +1092,62 @@ fn test_diff_hunk_selection_shows_only_selected_lines() {
 }
 
 #[test]
+fn test_diffedit_hunk_selection_keeps_selected_changes() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("file", "a\nb\nc\nd\ne\n");
+    work_dir.write_file("other", "other before\n");
+    work_dir.run_jj(["commit", "-m", "base"]).success();
+    work_dir.write_file("file", "a\nB1\nB2\nd\nE\n");
+    work_dir.write_file("other", "other after\n");
+    work_dir.run_jj(["commit", "-m", "edited"]).success();
+
+    let listing = work_dir
+        .run_jj(["diff", "--hunks", "-r", "@-", "file"])
+        .success();
+    let hunk_ids = listing
+        .stdout
+        .raw()
+        .lines()
+        .filter_map(|line| line.strip_prefix("hunk "))
+        .collect::<Vec<_>>();
+    assert_eq!(hunk_ids.len(), 2);
+
+    // Only `file` is in scope, so the unselected `other` change is kept while
+    // the unselected lines of `file` are dropped.
+    work_dir
+        .run_jj([
+            "diffedit",
+            "-r",
+            "@-",
+            "--hunk",
+            &format!("{}:-2,+2", hunk_ids[0]),
+            "file",
+        ])
+        .success();
+    assert_eq!(
+        work_dir
+            .run_jj(["file", "show", "-r", "@-", "file"])
+            .success()
+            .stdout
+            .raw(),
+        "a\nb\nB2\nd\ne\n"
+    );
+    assert_eq!(
+        work_dir
+            .run_jj(["file", "show", "-r", "@-", "other"])
+            .success()
+            .stdout
+            .raw(),
+        "other after\n"
+    );
+
+    let output = work_dir.run_jj(["diffedit", "--hunk", hunk_ids[0], "--tool", "false"]);
+    assert!(output.stderr.raw().contains("cannot be used with"));
+}
+
+#[test]
 fn test_absorb_hunk_selection() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
@@ -1494,4 +1550,77 @@ fn test_filtered_structural_hunk_moves_rename_whole() {
             .raw(),
         ""
     );
+}
+
+#[test_case("old"; "rename source")]
+#[test_case("new"; "rename target")]
+fn test_diffedit_drops_unselected_rename_in_fileset(path: &str) {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("keep", "before\n");
+    work_dir.write_file("old", "unique source contents\nsecond line\nthird line\n");
+    work_dir.run_jj(["commit", "-m", "base"]).success();
+    std::fs::rename(work_dir.root().join("old"), work_dir.root().join("new")).unwrap();
+    work_dir.write_file("keep", "after\n");
+    let listing = work_dir.run_jj(["diff", "--hunks", "keep"]).success();
+    let id = listing
+        .stdout
+        .raw()
+        .lines()
+        .find_map(|line| line.strip_prefix("hunk "))
+        .unwrap();
+
+    work_dir
+        .run_jj(["diffedit", "--hunk", id, "keep", path])
+        .success();
+
+    assert_eq!(
+        work_dir
+            .run_jj(["diff", "--summary"])
+            .success()
+            .stdout
+            .raw(),
+        "M keep\n"
+    );
+    assert_eq!(
+        work_dir.read_file("old"),
+        "unique source contents\nsecond line\nthird line\n"
+    );
+}
+
+#[test_case("d"; "structural boundary")]
+#[test_case("d/child"; "structural descendant")]
+fn test_diffedit_drops_unselected_structural_atom_in_fileset(path: &str) {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("keep", "before\n");
+    work_dir.write_file("d", "file before\n");
+    work_dir.run_jj(["commit", "-m", "base"]).success();
+    std::fs::remove_file(work_dir.root().join("d")).unwrap();
+    std::fs::create_dir(work_dir.root().join("d")).unwrap();
+    work_dir.write_file("d/child", "child after\n");
+    work_dir.write_file("keep", "after\n");
+    let listing = work_dir.run_jj(["diff", "--hunks", "keep"]).success();
+    let id = listing
+        .stdout
+        .raw()
+        .lines()
+        .find_map(|line| line.strip_prefix("hunk "))
+        .unwrap();
+
+    work_dir
+        .run_jj(["diffedit", "--hunk", id, "keep", path])
+        .success();
+
+    assert_eq!(
+        work_dir
+            .run_jj(["diff", "--summary"])
+            .success()
+            .stdout
+            .raw(),
+        "M keep\n"
+    );
+    assert_eq!(work_dir.read_file("d"), "file before\n");
 }
