@@ -21,7 +21,6 @@ use std::iter::zip;
 use std::sync::Arc;
 use std::vec;
 
-use futures::AsyncReadExt as _;
 use futures::FutureExt as _;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
@@ -30,7 +29,6 @@ use futures::stream::FuturesUnordered;
 use itertools::Itertools as _;
 
 use crate::backend;
-use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::MergedTreeVal;
 use crate::backend::MergedTreeValue;
@@ -41,7 +39,6 @@ use crate::files;
 use crate::merge::Merge;
 use crate::merge::SameChange;
 use crate::merged_tree::all_merged_tree_entries;
-use crate::object_id::ObjectId as _;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::repo_path::RepoPathComponentBuf;
@@ -453,19 +450,7 @@ async fn try_resolve_file_conflict(
     let file_id_conflict = file_id_conflict.simplify();
 
     let contents = file_id_conflict
-        .try_map_async(async |file_id| {
-            let mut content = vec![];
-            let mut reader = store.read_file(filename, file_id).await?;
-            reader
-                .read_to_end(&mut content)
-                .await
-                .map_err(|err| BackendError::ReadObject {
-                    object_type: file_id.object_type(),
-                    hash: file_id.hex(),
-                    source: err.into(),
-                })?;
-            BackendResult::Ok(content)
-        })
+        .try_map_async(async |file_id| store.read_file(filename, file_id).await?.read_all().await)
         .await?;
     if let Some(merged_content) = files::try_merge(&contents, options) {
         let id = store

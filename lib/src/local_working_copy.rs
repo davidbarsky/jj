@@ -1694,19 +1694,12 @@ impl FileSnapshotter<'_> {
                 return Ok(None);
             }
         };
-        let mut buf = vec![];
-        let mut reader = self
+        let buf = self
             .store()
             .read_file(&ignore_fallback_repo_path, file_id)
+            .await?
+            .read_all()
             .await?;
-        reader
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|err| BackendError::ReadFile {
-                path: ignore_fallback_repo_path,
-                id: file_id.clone(),
-                source: err.into(),
-            })?;
         Ok(Some(buf))
     }
 

@@ -85,8 +85,8 @@ pub async fn git_diff_part(
         }
         MaterializedTreeValue::File(mut file) => {
             mode = if file.executable { "100755" } else { "100644" };
-            hash = file.id.hex();
-            content = file_content_for_diff(path, &mut file, |content| content).await?;
+            hash = file.reader.id().hex();
+            content = file_content_for_diff(&mut file, |content| content).await?;
         }
         MaterializedTreeValue::Symlink { id, target } => {
             mode = "120000";

@@ -126,7 +126,6 @@ fn buf_to_file_contents(hash: Option<String>, buf: Vec<u8>) -> FileContents {
 
 async fn read_file_contents(
     materialized_value: MaterializedTreeValue,
-    path: &RepoPath,
     materialize_options: &ConflictMaterializeOptions,
 ) -> Result<FileInfo, BuiltinToolError> {
     match materialized_value {
@@ -144,13 +143,13 @@ async fn read_file_contents(
         }),
 
         MaterializedTreeValue::File(mut file) => {
-            let buf = file.read_all(path).await?;
+            let buf = file.reader.read_all().await?;
             let file_mode = if file.executable {
                 mode::EXECUTABLE
             } else {
                 mode::NORMAL
             };
-            let contents = buf_to_file_contents(Some(file.id.hex()), buf);
+            let contents = buf_to_file_contents(Some(file.reader.id().hex()), buf);
             Ok(FileInfo {
                 file_mode,
                 contents,
@@ -288,11 +287,10 @@ async fn make_diff_files(
     let mut changed_files = Vec::new();
     let mut files = Vec::new();
     while let Some(entry) = diff_stream.next().await {
-        let left_path = entry.path.source();
         let right_path = entry.path.target();
         let values = entry.values?;
-        let left_info = read_file_contents(values.before, left_path, &materialize_options).await?;
-        let right_info = read_file_contents(values.after, right_path, &materialize_options).await?;
+        let left_info = read_file_contents(values.before, &materialize_options).await?;
+        let right_info = read_file_contents(values.after, &materialize_options).await?;
         let mut sections = Vec::new();
 
         if left_info.file_mode != right_info.file_mode {

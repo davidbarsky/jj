@@ -1543,7 +1543,7 @@ async fn to_file_content(
         MaterializedTreeValue::Absent => Ok(empty()),
         MaterializedTreeValue::AccessDenied(_) => Ok(empty()),
         MaterializedTreeValue::File(mut file) => {
-            Ok(Merge::resolved(file.read_all(path).await?.into()))
+            Ok(Merge::resolved(file.reader.read_all().await?.into()))
         }
         MaterializedTreeValue::Symlink { id: _, target } => Ok(Merge::resolved(target.into())),
         MaterializedTreeValue::GitSubmodule(_) => Ok(empty()),

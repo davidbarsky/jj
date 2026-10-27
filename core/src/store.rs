@@ -19,8 +19,11 @@ use std::fmt::Formatter;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 
 use futures::AsyncRead;
+use futures::AsyncReadExt as _;
 use futures::stream::BoxStream;
 use pollster::FutureExt as _;
 
@@ -58,6 +61,44 @@ pub struct Store {
     commit_cache: CachedLoader<CommitId, Arc<backend::Commit>>,
     tree_cache: CachedLoader<(RepoPathBuf, TreeId), Arc<backend::Tree>>,
     merge_options: MergeOptions,
+}
+
+/// Retains the file identity used to attribute read failures.
+pub struct FileReader {
+    path: RepoPathBuf,
+    id: FileId,
+    reader: Pin<Box<dyn AsyncRead + Send>>,
+}
+
+impl FileReader {
+    /// Returns the identity captured when the file was opened.
+    pub fn id(&self) -> &FileId {
+        &self.id
+    }
+
+    /// Reads to EOF, attributing failures to the captured file and path.
+    pub async fn read_all(&mut self) -> BackendResult<Vec<u8>> {
+        let mut contents = Vec::new();
+        self.reader
+            .read_to_end(&mut contents)
+            .await
+            .map_err(|source| backend::BackendError::ReadFile {
+                path: self.path.clone(),
+                id: self.id.clone(),
+                source: source.into(),
+            })?;
+        Ok(contents)
+    }
+}
+
+impl AsyncRead for FileReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.reader.as_mut().poll_read(cx, buf)
+    }
 }
 
 impl Debug for Store {
@@ -246,12 +287,13 @@ impl Store {
     }
 
     /// Returns a reader for the contents of a file.
-    pub async fn read_file(
-        &self,
-        path: &RepoPath,
-        id: &FileId,
-    ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
-        self.backend.read_file(path, id).await
+    pub async fn read_file(&self, path: &RepoPath, id: &FileId) -> BackendResult<FileReader> {
+        let reader = FileReader {
+            path: path.to_owned(),
+            id: id.clone(),
+            reader: self.backend.read_file(path, id).await?,
+        };
+        Ok(reader)
     }
 
     /// Writes the contents of a file to the backend.
@@ -277,5 +319,45 @@ impl Store {
     pub fn clear_caches(&self) {
         self.commit_cache.clear();
         self.tree_cache.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailedRead;
+
+    impl AsyncRead for FailedRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("read failure")))
+        }
+    }
+
+    #[test]
+    fn test_read_all_retains_file_identity_after_partial_read() {
+        let path = RepoPathBuf::from_internal_string("file").unwrap();
+        let id = FileId::new(vec![1]);
+        let mut reader = FileReader {
+            path: path.clone(),
+            id: id.clone(),
+            reader: Box::pin(futures::io::Cursor::new(b"partial").chain(FailedRead)),
+        };
+        match reader.read_all().block_on().unwrap_err() {
+            backend::BackendError::ReadFile {
+                path: actual_path,
+                id: actual_id,
+                source,
+            } => {
+                assert_eq!(actual_path, path);
+                assert_eq!(actual_id, id);
+                assert_eq!(source.to_string(), "read failure");
+            }
+            error => panic!("unexpected error: {error}"),
+        }
     }
 }

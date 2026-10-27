@@ -129,7 +129,7 @@ pub async fn split_hunks_to_trees(
         let values = entry.values?;
         let (left_text, executable, copy_id) = match to_file_value(values.before) {
             Ok(Some(mut value)) => (
-                value.read_all(left_path).await?,
+                value.reader.read_all().await?,
                 value.executable,
                 value.copy_id,
             ),
@@ -143,7 +143,7 @@ pub async fn split_hunks_to_trees(
             }
         };
         let (right_text, deleted) = match to_file_value(values.after) {
-            Ok(Some(mut value)) => (value.read_all(right_path).await?, false),
+            Ok(Some(mut value)) => (value.reader.read_all().await?, false),
             Ok(None) => (vec![], true),
             Err(reason) => {
                 selected_trees

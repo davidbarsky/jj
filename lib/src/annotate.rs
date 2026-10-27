@@ -456,7 +456,7 @@ async fn get_file_contents(
     let effective_file_value =
         materialize_tree_value(store, path, file_value, tree.labels()).await?;
     match effective_file_value {
-        MaterializedTreeValue::File(mut file) => Ok(file.read_all(path).await?.into()),
+        MaterializedTreeValue::File(mut file) => Ok(file.reader.read_all().await?.into()),
         MaterializedTreeValue::FileConflict(file) => {
             // TODO: track line origins without materializing
             let options = ConflictMaterializeOptions {

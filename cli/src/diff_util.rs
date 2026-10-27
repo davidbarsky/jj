@@ -1441,7 +1441,7 @@ async fn diff_content_with<T>(
             contents: map_resolved(format!("Access denied: {err}").into()),
         }),
         MaterializedTreeValue::File(mut file) => {
-            file_content_for_diff(path, &mut file, map_resolved).await
+            file_content_for_diff(&mut file, map_resolved).await
         }
         MaterializedTreeValue::Symlink { id: _, target } => Ok(FileContent {
             // Unix file paths can't contain null bytes.

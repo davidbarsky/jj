@@ -17,14 +17,11 @@
 use std::io;
 use std::io::Write;
 use std::iter::zip;
-use std::pin::Pin;
 
 use bstr::BStr;
 use bstr::BString;
 use bstr::ByteSlice as _;
 use bstr::ByteVec as _;
-use futures::AsyncRead;
-use futures::AsyncReadExt as _;
 use futures::Stream;
 use futures::StreamExt as _;
 use futures::future::try_join_all;
@@ -94,38 +91,18 @@ fn write_diff_hunks(hunks: &[DiffHunk], file: &mut dyn Write) -> io::Result<()> 
     Ok(())
 }
 
-async fn get_file_contents(
-    store: &Store,
-    path: &RepoPath,
-    term: Option<&FileId>,
-) -> BackendResult<BString> {
-    match term {
-        Some(id) => {
-            let mut reader = store.read_file(path, id).await?;
-            let mut content = vec![];
-            reader
-                .read_to_end(&mut content)
-                .await
-                .map_err(|err| BackendError::ReadFile {
-                    path: path.to_owned(),
-                    id: id.clone(),
-                    source: err.into(),
-                })?;
-            Ok(BString::new(content))
-        }
-        // If the conflict had removed the file on one side, we pretend that the file
-        // was empty there.
-        None => Ok(BString::new(vec![])),
-    }
-}
-
 pub async fn extract_as_single_hunk(
     merge: &Merge<Option<FileId>>,
     store: &Store,
     path: &RepoPath,
 ) -> BackendResult<Merge<BString>> {
     merge
-        .try_map_async(|term| get_file_contents(store, path, term.as_ref()))
+        .try_map_async(async |term| match term {
+            Some(id) => Ok(BString::new(
+                store.read_file(path, id).await?.read_all().await?,
+            )),
+            None => Ok(BString::default()),
+        })
         .await
 }
 
@@ -160,27 +137,9 @@ impl MaterializedTreeValue {
 
 /// [`TreeValue::File`] with file content `reader`.
 pub struct MaterializedFileValue {
-    pub id: FileId,
     pub executable: bool,
     pub copy_id: CopyId,
-    pub reader: Pin<Box<dyn AsyncRead + Send>>,
-}
-
-impl MaterializedFileValue {
-    /// Reads file content until EOF. The provided `path` is used only for error
-    /// reporting purpose.
-    pub async fn read_all(&mut self, path: &RepoPath) -> BackendResult<Vec<u8>> {
-        let mut buf = Vec::new();
-        self.reader
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|err| BackendError::ReadFile {
-                path: path.to_owned(),
-                id: self.id.clone(),
-                source: err.into(),
-            })?;
-        Ok(buf)
-    }
+    pub reader: crate::store::FileReader,
 }
 
 /// Conflicted [`TreeValue::File`]s with file contents.
@@ -234,7 +193,6 @@ async fn materialize_tree_value_no_access_denied(
         })) => {
             let reader = store.read_file(path, &id).await?;
             Ok(MaterializedTreeValue::File(MaterializedFileValue {
-                id,
                 executable,
                 copy_id,
                 reader,

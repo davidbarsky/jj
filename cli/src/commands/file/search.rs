@@ -105,7 +105,9 @@ pub(crate) async fn cmd_file_search(
             let mut materialized =
                 materialize_tree_value(store.as_ref(), &path, value?, tree.labels()).await?;
             let content = match &mut materialized {
-                MaterializedTreeValue::File(file_value) => Some(file_value.read_all(&path).await?),
+                MaterializedTreeValue::File(file_value) => {
+                    Some(file_value.reader.read_all().await?)
+                }
                 _ => None,
             };
             Ok((path, materialized, content))

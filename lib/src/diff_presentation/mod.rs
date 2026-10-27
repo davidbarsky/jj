@@ -32,7 +32,6 @@ use crate::diff::DiffHunk;
 use crate::diff::DiffHunkKind;
 use crate::diff::find_line_ranges;
 use crate::merge::Diff;
-use crate::repo_path::RepoPath;
 
 pub mod unified;
 // TODO: colored_diffs utils should also be moved from `jj_cli::diff_utils` to
@@ -54,7 +53,6 @@ pub struct FileContent<T> {
 }
 
 pub async fn file_content_for_diff<T>(
-    path: &RepoPath,
     file: &mut MaterializedFileValue,
     map_resolved: impl FnOnce(BString) -> T,
 ) -> BackendResult<FileContent<T>> {
@@ -65,7 +63,7 @@ pub async fn file_content_for_diff<T>(
     // TODO: currently we look at the whole file, even though for binary files we
     // only need to know the file size. To change that we'd have to extend all
     // the data backends to support getting the length.
-    let contents = BString::new(file.read_all(path).await?);
+    let contents = BString::new(file.reader.read_all().await?);
     let start = &contents[..PEEK_SIZE.min(contents.len())];
     Ok(FileContent {
         is_binary: start.contains(&b'\0'),
